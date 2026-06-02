@@ -1,0 +1,24 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Generated runtime artifacts
+appserver.log
+generated_entries.json
+generated_images/
+generation_log.jsonl
+generation_success.txt
+generation_success.xlsx
+generation_failed.txt
+generation_failed.xlsx
+import_log.jsonl
+import_success.txt
+import_success.xlsx
+import_failed.txt
+import_failed.xlsx
+success.txt
+failed.txt
+my_words.json
+usage.txt
+words.txt
+

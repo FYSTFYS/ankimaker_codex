@@ -1,0 +1,28 @@
+{
+  "deck": "日常想到的",
+  "note_type": "OnlineDictHelper",
+  "use_existing_note_type": true,
+  "image": {
+    "source": "internet",
+    "provider": "wikimedia_commons"
+  },
+  "duplicate_check": {
+    "field": "expression"
+  },
+  "field_map": {
+    "expression": "word",
+    "reading": "phonetic",
+    "glossary": "full_note",
+    "sentence": "empty",
+    "note": "empty",
+    "url": "empty",
+    "audio": "audio"
+  },
+  "outputs": {
+    "success_txt": "import_success.txt",
+    "success_xlsx": "import_success.xlsx",
+    "failed_txt": "import_failed.txt",
+    "failed_xlsx": "import_failed.xlsx",
+    "log_jsonl": "import_log.jsonl"
+  }
+}
