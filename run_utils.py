@@ -4,6 +4,7 @@ import html
 import json
 import sys
 import zipfile
+from xml.etree import ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ class StepLogger:
     def __init__(self, log_path: Path | None = None) -> None:
         self.log_path = log_path
         if self.log_path:
-            self.log_path.write_text("", encoding="utf-8")
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, stage: str, status: str, word: str = "", detail: str = "") -> None:
         timestamp = dt.datetime.now().isoformat(timespec="seconds")
@@ -42,10 +43,56 @@ def xlsx_col_name(index: int) -> str:
     return name
 
 
+def _read_xlsx_sheet(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    namespace = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    with zipfile.ZipFile(path, "r") as archive:
+        sheet_xml = archive.read("xl/worksheets/sheet1.xml")
+    root = ET.fromstring(sheet_xml)
+    rows = root.find("main:sheetData", namespace)
+    if rows is None:
+        return [], []
+
+    parsed_headers: list[str] = []
+    parsed_rows: list[dict[str, str]] = []
+
+    for row_index, row in enumerate(rows.findall("main:row", namespace), start=1):
+        values: list[str] = []
+        for cell in row.findall("main:c", namespace):
+            cell_type = cell.attrib.get("t", "")
+            if cell_type == "inlineStr":
+                text = cell.findtext("main:is/main:t", default="", namespaces=namespace)
+            else:
+                text = cell.findtext("main:v", default="", namespaces=namespace)
+            values.append(text or "")
+        if row_index == 1:
+            parsed_headers = values
+            continue
+        if not parsed_headers:
+            continue
+        parsed_rows.append({header: values[i] if i < len(values) else "" for i, header in enumerate(parsed_headers)})
+
+    return parsed_headers, parsed_rows
+
+
 def write_xlsx(path: Path, sheet_name: str, headers: list[str], rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_rows: list[dict[str, str]] = []
+    if path.exists():
+        try:
+            existing_headers, existing_rows = _read_xlsx_sheet(path)
+            if existing_headers and existing_headers != headers:
+                raise ValueError(
+                    f"Existing XLSX headers do not match requested headers for {path}: {existing_headers!r} != {headers!r}"
+                )
+        except Exception:
+            existing_rows = []
+
+    all_rows = existing_rows + [{key: str(value) for key, value in row.items()} for row in rows]
+
     matrix = [headers]
-    for row in rows:
+    for row in all_rows:
         matrix.append([str(row.get(header, "")) for header in headers])
 
     sheet_rows = []
@@ -98,4 +145,13 @@ def write_xlsx(path: Path, sheet_name: str, headers: list[str], rows: list[dict[
 
 
 def write_text(path: Path, lines: list[str]) -> None:
-    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    if not lines:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(lines) + ("\n" if lines else "")
+    if path.exists() and path.stat().st_size > 0 and content:
+        with path.open("ab") as handle:
+            handle.write(b"\n" if not path.read_bytes().endswith(b"\n") else b"")
+            handle.write(content.encode("utf-8"))
+        return
+    path.write_text(content, encoding="utf-8")

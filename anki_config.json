@@ -2,6 +2,12 @@
   "deck": "日常想到的",
   "note_type": "OnlineDictHelper",
   "use_existing_note_type": true,
+  "llm": {
+    "provider": "doubao",
+    "model": "doubao-seed-2-0-lite-260428",
+    "api_key": "ark-29a195e5-0661-4849-ab60-9959446e939d-4c8c9",
+    "prompt_template": "我要你帮我记忆单词，我给出一个单词：{word}\n\n规则：\n- 如果这个单词不是真实的英文单词，只输出：非英文单词\n- 如果是真实英文单词，只输出 JSON，不要解释，不要代码块，不要多余文字\n- JSON 必须包含这些字段：\n  - word：单词原形\n  - phonetic：音标\n  - meanings_image：数组，每项必须是对象，格式为 {\"meaning\":\"...\",\"image_memory\":\"...\"}，至少 2 项\n  - related_words：相关词汇数组\n  - collocations：数组，每项必须是对象，格式为 {\"phrase\":\"...\",\"translation\":\"...\",\"example\":\"...\"}\n  - memory_method：记忆方法\n- 内容要短、清楚、适合记忆"
+  },
   "image": {
     "source": "internet",
     "provider": "wikimedia_commons"

@@ -19,13 +19,31 @@ from run_utils import StepLogger, write_text, write_xlsx
 
 
 ANKI_CONNECT_URL = os.getenv("ANKI_CONNECT_URL", "http://127.0.0.1:8765")
+DEFAULT_LLM_PROVIDER = os.getenv("LLM_PROVIDER", "doubao").lower()
 OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/responses")
+DOUBAO_API_URL = os.getenv("DOUBAO_API_URL", "https://ark.cn-beijing.volces.com/api/v3/responses")
 OPENAI_IMAGE_API_URL = os.getenv("OPENAI_IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+DEFAULT_DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-seed-2-0-lite-260428")
 DEFAULT_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 DEFAULT_DECK = os.getenv("ANKI_DECK", "English::AI Words")
 DEFAULT_NOTE_TYPE = os.getenv("ANKI_NOTE_TYPE", "AI English Word")
 DEFAULT_CONFIG = "anki_config.json"
+DEFAULT_WORD_PROMPT = """
+我要你帮我记忆单词，我给出一个单词：{word}
+
+规则：
+- 如果这个单词不是真实的英文单词，只输出：非英文单词
+- 如果是真实英文单词，只输出 JSON，不要解释，不要代码块，不要多余文字
+- JSON 必须包含这些字段：
+  - word：单词原形
+  - phonetic：音标
+  - meanings_image：常见释义及图片记忆，至少 2 项
+  - related_words：相关词汇
+  - collocations：地道用法/固定搭配
+  - memory_method：记忆方法
+- 内容要短、清楚、适合记忆
+""".strip()
 
 FIELDS = [
     "Word",
@@ -36,6 +54,10 @@ FIELDS = [
     "Collocations",
     "MemoryMethod",
 ]
+
+
+class NonEnglishWordError(RuntimeError):
+    pass
 
 
 CARD_CSS = """
@@ -219,6 +241,68 @@ def load_config(path: str) -> dict[str, Any]:
         return json.load(handle)
 
 
+def resolve_relative_path(path_value: str | Path, base_dir: Path) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return base_dir / path
+
+
+def resolve_output_path(
+    configured_value: Any,
+    default_value: str,
+    base_dir: Path,
+    stem: str | None,
+    derived_name: str,
+) -> Path:
+    value = str(configured_value or default_value)
+    if stem and value == default_value:
+        value = derived_name
+    return resolve_relative_path(value, base_dir)
+
+
+def resolve_llm_settings(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, str]:
+    llm_config = config.get("llm", {})
+    provider = (args.provider or llm_config.get("provider") or DEFAULT_LLM_PROVIDER).lower()
+    if provider not in {"openai", "doubao"}:
+        raise RuntimeError(f"Unsupported LLM provider: {provider}")
+
+    default_model = DEFAULT_DOUBAO_MODEL if provider == "doubao" else DEFAULT_OPENAI_MODEL
+    api_url = (
+        args.api_url
+        or llm_config.get("api_url")
+        or (DOUBAO_API_URL if provider == "doubao" else OPENAI_API_URL)
+    )
+    model = args.model or llm_config.get("model") or default_model
+    return {
+        "provider": provider,
+        "api_url": api_url,
+        "model": model,
+        "api_key": resolve_llm_api_key(provider, llm_config),
+        "prompt_template": str(llm_config.get("prompt_template") or DEFAULT_WORD_PROMPT),
+    }
+
+
+def resolve_llm_api_key(provider: str, llm_config: dict[str, Any]) -> str:
+    configured_key = llm_config.get("api_key")
+    if isinstance(configured_key, str) and configured_key.strip():
+        return configured_key.strip()
+
+    env_names = ["LLM_API_KEY"]
+    if provider == "doubao":
+        env_names.append("ARK_API_KEY")
+    else:
+        env_names.append("OPENAI_API_KEY")
+
+    for env_name in env_names:
+        api_key = os.getenv(env_name)
+        if api_key:
+            return api_key
+
+    expected = "ARK_API_KEY" if provider == "doubao" else "OPENAI_API_KEY"
+    raise RuntimeError(f"{expected} is not set.")
+
+
 def read_words(args: argparse.Namespace) -> list[str]:
     if args.entries_json:
         return []
@@ -258,45 +342,90 @@ def extract_response_text(response: dict[str, Any]) -> str:
     return "\n".join(texts).strip()
 
 
-def generate_word_entry(word: str, model: str) -> dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
+def coerce_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    return [value]
 
-    prompt = f"""
-请为英语单词 "{word}" 生成一张适合 Anki 背诵的中文解释卡片。
 
-要求：
-- 单词原样返回。
-- 音标优先给英式和美式；如果无法可靠区分，可以给一个常见音标。
-- 常见含义给 2-4 个，按考试/日常常用度排序。
-- 每个含义都配一个具体、鲜明、容易在脑中成像的“图片记忆”场景。
-- 相关词扩展包含词根词缀、派生词、近义词或反义词，控制在 4-8 条。
-- 常见搭配给 4-6 条，每条包含英文搭配、中文意思、一个短例句。
-- 记忆方法要实用，可以用词根、拆词、谐音或场景联想，但不要牵强。
-- 只输出符合 JSON schema 的 JSON。
-""".strip()
+def normalize_meanings_image(value: Any) -> list[dict[str, str]]:
+    items = coerce_list(value)
+    normalized: list[dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict):
+            meaning = item.get("meaning") or item.get("translation") or item.get("text") or ""
+            image_memory = item.get("image_memory") or item.get("image") or item.get("memory") or meaning
+            normalized.append(
+                {
+                    "meaning": str(meaning).strip(),
+                    "image_memory": str(image_memory).strip(),
+                }
+            )
+        else:
+            text = str(item).strip()
+            if text:
+                normalized.append(
+                    {
+                        "meaning": text,
+                        "image_memory": text,
+                    }
+                )
+    if len(normalized) == 1:
+        normalized.append(
+            {
+                "meaning": normalized[0]["meaning"],
+                "image_memory": normalized[0]["image_memory"],
+            }
+        )
+    return normalized
+
+
+def normalize_entry(entry: dict[str, Any], word: str) -> dict[str, Any]:
+    normalized = dict(entry)
+    normalized["word"] = str(normalized.get("word") or word).strip() or word
+    normalized["phonetic"] = str(normalized.get("phonetic") or "").strip()
+    normalized["meanings_image"] = normalize_meanings_image(normalized.get("meanings_image"))
+    normalized["related_words"] = [str(item).strip() for item in coerce_list(normalized.get("related_words")) if str(item).strip()]
+    normalized["collocations"] = [
+        (
+            {
+                "phrase": str(item.get("phrase") or item.get("collocation") or item.get("text") or "").strip(),
+                "translation": str(item.get("translation") or item.get("meaning") or "").strip(),
+                "example": str(item.get("example") or item.get("sentence") or "").strip(),
+            }
+            if isinstance(item, dict)
+            else {
+                "phrase": str(item).strip(),
+                "translation": str(item).strip(),
+                "example": str(item).strip(),
+            }
+        )
+        for item in coerce_list(normalized.get("collocations"))
+        if str(item).strip()
+    ]
+    normalized["memory_method"] = str(normalized.get("memory_method") or "").strip()
+    return normalized
+
+
+def generate_word_entry(word: str, model: str, api_url: str, api_key: str, prompt_template: str) -> dict[str, Any]:
+    prompt = prompt_template.replace("{word}", word)
 
     response = post_json(
-        OPENAI_API_URL,
+        api_url,
         {
             "model": model,
             "input": prompt,
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "anki_word_entry",
-                    "strict": True,
-                    "schema": WORD_SCHEMA,
-                }
-            },
         },
         {"Authorization": f"Bearer {api_key}"},
     )
     text = extract_response_text(response)
     if not text:
         raise RuntimeError(f"OpenAI returned no text for {word!r}.")
-    return json.loads(text)
+    if text.strip() == "非英文单词":
+        raise NonEnglishWordError(word)
+    return normalize_entry(json.loads(text), word)
 
 
 def fetch_json(url: str) -> dict[str, Any]:
@@ -596,6 +725,21 @@ def note_exists(deck: str, note_type: str, fields: dict[str, str], config: dict[
     return bool(invoke_anki("findNotes", {"query": query}))
 
 
+def existing_note_ids_for_word(deck: str, note_type: str, word: str, config: dict[str, Any]) -> list[int]:
+    duplicate = config.get("duplicate_check", {})
+    if duplicate is False:
+        return []
+
+    field_name = duplicate.get("field", "expression") if isinstance(duplicate, dict) else "expression"
+    query = (
+        f'deck:"{anki_query_escape(deck)}" '
+        f'note:"{anki_query_escape(note_type)}" '
+        f'{field_name}:"{anki_query_escape(word)}"'
+    )
+    note_ids = invoke_anki("findNotes", {"query": query})
+    return [int(note_id) for note_id in note_ids]
+
+
 def add_note(deck: str, note_type: str, entry: dict[str, Any], tags: list[str], media_filename: str | None, config: dict[str, Any]) -> int:
     fields = build_configured_fields(entry, media_filename, config)
     if note_exists(deck, note_type, fields, config):
@@ -624,6 +768,19 @@ def write_preview(path: str, entries: list[dict[str, Any]]) -> None:
         json.dump(entries, handle, ensure_ascii=False, indent=2)
 
 
+def success_summary_line(word: str, ai_status: str, anki_status: str, detail: str = "", note_id: Any = "") -> str:
+    parts = [word, f"AI={ai_status}", f"ANKI={anki_status}"]
+    if detail:
+        parts.append(detail)
+    if note_id != "":
+        parts.append(f"note_id={note_id}")
+    return "\t".join(parts)
+
+
+def failed_summary_line(word: str, ai_status: str, anki_status: str, reason: str) -> str:
+    return "\t".join([word, f"AI={ai_status}", f"ANKI={anki_status}", reason])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate AI English word cards and add them to Anki through AnkiConnect."
@@ -634,7 +791,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"JSON config file. Default: {DEFAULT_CONFIG}")
     parser.add_argument("--deck", default=DEFAULT_DECK, help=f"Anki deck name. Default: {DEFAULT_DECK}")
     parser.add_argument("--note-type", default=DEFAULT_NOTE_TYPE, help=f"Anki note type. Default: {DEFAULT_NOTE_TYPE}")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenAI model. Default: {DEFAULT_MODEL}")
+    parser.add_argument(
+        "--provider",
+        choices=["openai", "doubao"],
+        help=f"LLM provider for word generation. Default: {DEFAULT_LLM_PROVIDER}",
+    )
+    parser.add_argument("--model", help="LLM model override.")
+    parser.add_argument("--api-url", help="LLM responses API URL override.")
     parser.add_argument("--image-model", default=DEFAULT_IMAGE_MODEL, help=f"OpenAI image model. Default: {DEFAULT_IMAGE_MODEL}")
     parser.add_argument("--image-size", default="1024x1024", help="Image size. Default: 1024x1024")
     parser.add_argument("--image-quality", default="low", help="Image quality: low, medium, or high. Default: low")
@@ -652,11 +815,27 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     outputs = config.get("outputs", {})
-    logger = StepLogger(Path(outputs.get("log_jsonl", "import_log.jsonl")))
+    input_base_dir = Path.cwd()
+    input_stem: str | None = None
+    if args.file:
+        input_path = Path(args.file).resolve()
+        input_base_dir = input_path.parent
+        input_stem = input_path.stem
+    logger = StepLogger(
+        resolve_output_path(
+            outputs.get("log_jsonl"),
+            "import_log.jsonl",
+            input_base_dir,
+            input_stem,
+            f"{input_stem}_log.jsonl" if input_stem else "import_log.jsonl",
+        )
+    )
     logger.emit("config_loaded", "ok", "", args.config)
     deck = args.deck if args.deck != DEFAULT_DECK else config.get("deck", args.deck)
     note_type = args.note_type if args.note_type != DEFAULT_NOTE_TYPE else config.get("note_type", args.note_type)
     image_source = config.get("image", {}).get("source", "generated")
+    llm = resolve_llm_settings(args, config)
+    logger.emit("llm_config", "ok", "", f"{llm['provider']} {llm['model']}")
 
     if args.entries_json:
         entries_to_add = load_entries(args.entries_json)
@@ -684,19 +863,110 @@ def main() -> int:
     import_failed: list[str] = []
     import_success_rows: list[dict[str, Any]] = []
     import_failed_rows: list[dict[str, Any]] = []
-    success_txt = Path(outputs.get("success_txt", "import_success.txt"))
-    success_xlsx = Path(outputs.get("success_xlsx", "import_success.xlsx"))
-    failed_txt = Path(outputs.get("failed_txt", "import_failed.txt"))
-    failed_xlsx = Path(outputs.get("failed_xlsx", "import_failed.xlsx"))
+    written_success_count = 0
+    written_failed_count = 0
+    success_txt = resolve_output_path(
+        outputs.get("success_txt"),
+        "import_success.txt",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_success.txt" if input_stem else "import_success.txt",
+    )
+    success_xlsx = resolve_output_path(
+        outputs.get("success_xlsx"),
+        "import_success.xlsx",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_success.xlsx" if input_stem else "import_success.xlsx",
+    )
+    failed_txt = resolve_output_path(
+        outputs.get("failed_txt"),
+        "import_failed.txt",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_failed.txt" if input_stem else "import_failed.txt",
+    )
+    failed_xlsx = resolve_output_path(
+        outputs.get("failed_xlsx"),
+        "import_failed.xlsx",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_failed.xlsx" if input_stem else "import_failed.xlsx",
+    )
+    preview_json_path = resolve_relative_path(args.preview_json, input_base_dir) if args.preview_json else None
 
     for index, word in enumerate(words, start=1):
         logger.emit("word_start", "running", word, f"{index}/{len(words)}")
+        if not args.entries_json:
+            existing_note_ids = existing_note_ids_for_word(deck, note_type, word, config)
+            if existing_note_ids:
+                reason = "Anki 已存在该单词"
+                logger.emit("precheck_duplicate", "skipped", word, reason)
+                print(f"[{index}/{len(words)}] skipped {word}: {reason}", file=sys.stderr)
+                import_failed.append(failed_summary_line(word, "not_created", "duplicate", reason))
+                import_failed_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": word,
+                        "ai_status": "not_created",
+                        "anki_status": "duplicate",
+                        "stage": "precheck_duplicate",
+                        "error_type": "DuplicateNoteError",
+                        "error_message": reason,
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                continue
         if args.entries_json:
             entry = entries_to_add[index - 1]
         else:
             logger.emit("generate_entry", "running", word)
             print(f"[{index}/{len(words)}] generating {word}...", file=sys.stderr)
-            entry = generate_word_entry(word, args.model)
+            try:
+                entry = generate_word_entry(
+                    word,
+                    llm["model"],
+                    llm["api_url"],
+                    llm["api_key"],
+                    llm["prompt_template"],
+                )
+            except NonEnglishWordError:
+                logger.emit("generate_entry", "skipped", word, "非英文单词")
+                print(f"[{index}/{len(words)}] 非英文单词: {word}", file=sys.stderr)
+                import_failed.append(failed_summary_line(word, "failed", "not_created", "非英文单词"))
+                import_failed_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": word,
+                        "ai_status": "failed",
+                        "anki_status": "not_created",
+                        "stage": "generate_entry",
+                        "error_type": "NonEnglishWordError",
+                        "error_message": "非英文单词",
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                continue
+            except Exception as exc:
+                logger.emit("generate_entry", "failed", word, str(exc))
+                print(f"[{index}/{len(words)}] failed to generate {word}: {exc}", file=sys.stderr)
+                import_failed.append(failed_summary_line(word, "failed", "not_created", str(exc)))
+                import_failed_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": word,
+                        "ai_status": "failed",
+                        "anki_status": "not_created",
+                        "stage": "generate_entry",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                continue
             logger.emit("generate_entry", "ok", word)
         entries.append(entry)
 
@@ -747,32 +1017,56 @@ def main() -> int:
                 f'note:"{anki_query_escape(note_type)}" '
                 f'{duplicate_field}:"{anki_query_escape(fields.get(duplicate_field, ""))}"'
             )
-            existing_notes = invoke_anki("findNotes", {"query": query}) if args.update_existing else []
+            existing_notes = invoke_anki("findNotes", {"query": query})
             if existing_notes:
-                for note_id in existing_notes:
-                    invoke_anki("updateNoteFields", {"note": {"id": note_id, "fields": fields}})
-                    print(f"updated {entry['word']} note_id={note_id}", file=sys.stderr)
-                    import_success_rows.append(
+                if args.update_existing:
+                    for note_id in existing_notes:
+                        invoke_anki("updateNoteFields", {"note": {"id": note_id, "fields": fields}})
+                        print(f"updated {entry['word']} note_id={note_id}", file=sys.stderr)
+                        import_success_rows.append(
+                            {
+                                "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                                "word": entry["word"],
+                                "ai_status": "success",
+                                "anki_status": "success",
+                                "action": "updated",
+                                "note_id": note_id,
+                                "deck": deck,
+                                "note_type": note_type,
+                            }
+                        )
+                    added += len(existing_notes)
+                    import_success.append(success_summary_line(entry["word"], "success", "success", "updated", existing_notes[-1]))
+                else:
+                    reason = "Anki 已存在该单词"
+                    print(f"skipped {entry['word']}: {reason}", file=sys.stderr)
+                    import_failed.append(failed_summary_line(entry["word"], "success", "duplicate", reason))
+                    import_failed_rows.append(
                         {
                             "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                             "word": entry["word"],
-                            "action": "updated",
-                            "note_id": note_id,
+                            "ai_status": "success",
+                            "anki_status": "duplicate",
+                            "stage": "duplicate_check",
+                            "error_type": "DuplicateNoteError",
+                            "error_message": reason,
                             "deck": deck,
                             "note_type": note_type,
                         }
                     )
-                added += len(existing_notes)
-                import_success.append(entry["word"])
+                    logger.emit("add_or_update_note", "skipped", entry["word"], reason)
+                    continue
             else:
                 note_id = add_note(deck, note_type, entry, args.tag, media_filename, config)
                 added += 1
                 print(f"added {entry['word']} note_id={note_id}", file=sys.stderr)
-                import_success.append(entry["word"])
+                import_success.append(success_summary_line(entry["word"], "success", "success", "added", note_id))
                 import_success_rows.append(
                     {
                         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                         "word": entry["word"],
+                        "ai_status": "success",
+                        "anki_status": "success",
                         "action": "added",
                         "note_id": note_id,
                         "deck": deck,
@@ -782,11 +1076,13 @@ def main() -> int:
             logger.emit("add_or_update_note", "ok", entry["word"])
         except RuntimeError as exc:
             print(f"skipped {entry['word']}: {exc}", file=sys.stderr)
-            import_failed.append(f"{entry['word']}\t{exc}")
+            import_failed.append(failed_summary_line(entry["word"], "success", "failed", str(exc)))
             import_failed_rows.append(
                 {
                     "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                     "word": entry["word"],
+                    "ai_status": "success",
+                    "anki_status": "failed",
                     "stage": "add_or_update_note",
                     "error_type": type(exc).__name__,
                     "error_message": str(exc),
@@ -799,27 +1095,29 @@ def main() -> int:
             time.sleep(args.sleep)
 
         logger.emit("write_import_success_txt", "running", "", str(success_txt))
-        write_text(success_txt, import_success)
+        write_text(success_txt, import_success[written_success_count:])
         logger.emit("write_import_success_xlsx", "running", "", str(success_xlsx))
         write_xlsx(
             success_xlsx,
             "ImportSuccess",
-            ["timestamp", "word", "action", "note_id", "deck", "note_type"],
-            import_success_rows,
+            ["timestamp", "word", "ai_status", "anki_status", "action", "note_id", "deck", "note_type"],
+            import_success_rows[written_success_count:],
         )
         logger.emit("write_import_failed_txt", "running", "", str(failed_txt))
-        write_text(failed_txt, import_failed)
+        write_text(failed_txt, import_failed[written_failed_count:])
         logger.emit("write_import_failed_xlsx", "running", "", str(failed_xlsx))
         write_xlsx(
             failed_xlsx,
             "ImportFailed",
-            ["timestamp", "word", "stage", "error_type", "error_message", "deck", "note_type"],
-            import_failed_rows,
+            ["timestamp", "word", "ai_status", "anki_status", "stage", "error_type", "error_message", "deck", "note_type"],
+            import_failed_rows[written_failed_count:],
         )
+        written_success_count = len(import_success)
+        written_failed_count = len(import_failed)
 
-    if args.preview_json:
-        logger.emit("write_preview_json", "running", "", args.preview_json)
-        write_preview(args.preview_json, entries)
+    if preview_json_path:
+        logger.emit("write_preview_json", "running", "", str(preview_json_path))
+        write_preview(str(preview_json_path), entries)
 
     if args.dry_run:
         print(json.dumps(entries, ensure_ascii=False, indent=2))

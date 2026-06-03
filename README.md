@@ -32,120 +32,33 @@
 
 1. 安装并启动 Anki。
 2. 在 Anki 里安装 AnkiConnect 插件，保持 Anki 打开。
-3. 如果你要让脚本自己直连 OpenAI 生成内容，设置 OpenAI API key：
+3. 如果你要让脚本自己直连大模型生成内容，直接在 `anki_config.json` 的 `llm.api_key` 里填写对应的 API key。
 
-```bash
-export OPENAI_API_KEY="你的 key"
-```
+你也可以在 `llm.prompt_template` 里直接改豆包提示词。
 
 默认会连接：
 
 - AnkiConnect: `http://127.0.0.1:8765`
-- OpenAI model: `gpt-4.1-mini`
+- LLM provider: `doubao`
+- Doubao model: `doubao-seed-2-0-lite-260428`
 - Anki deck: `English::AI Words`
 - Anki note type: `AI English Word`
 
 这些都可以用环境变量或命令行参数覆盖。
 
-## 两步执行
-
-现在流程分成两个可以单独执行的步骤。
-
-### 1. 生成单词卡片内容
-
-配置文件：`codex_appserver_config.json`
-
-里面包含：
-
-- app server 启动命令：`codex app-server --listen ws://127.0.0.1:4500`
-- 使用模型：`gpt-5.5`
-- 输出 schema：`codex_word_schema.json`
-- prompt 模板
-- 生成成功/失败/日志文件路径
-
-运行：
+如果你想切回 OpenAI：
 
 ```bash
-python3 codex_generate_words.py --start-app-server wagon
+export LLM_PROVIDER="openai"
+export OPENAI_API_KEY="你的 key"
+export OPENAI_MODEL="gpt-4.1-mini"
 ```
 
-也可以批量：
+也可以继续把 API key 写在 `anki_config.json` 的 `llm.api_key` 里，脚本会优先读取配置文件。
 
-```bash
-python3 codex_generate_words.py --file examples/words.txt
-```
+如果你用 `--file words.txt`，默认输出会写成 `words_success.*`、`words_failed.*` 和 `words_log.jsonl`，都在 `words.txt` 同目录。
 
-生成阶段输出：
-
-- `generated_entries.json`：成功生成的完整结果
-- `generation_success.txt`：生成成功的单词
-- `generation_success.xlsx`：生成成功明细
-- `generation_failed.txt`：生成失败摘要
-- `generation_failed.xlsx`：生成失败明细，分列记录 stage、error、command、prompt、stdout、stderr
-- `generation_log.jsonl`：每个功能节点的运行日志
-
-### 2. 导入 Anki
-
-配置文件：`anki_config.json`
-
-运行：
-
-```bash
-python3 ankimaker.py --entries-json generated_entries.json --config anki_config.json --update-existing --no-images
-```
-
-导入阶段输出：
-
-- `import_success.txt`：导入成功的单词
-- `import_success.xlsx`：导入成功明细，包含 note id
-- `import_failed.txt`：导入失败摘要
-- `import_failed.xlsx`：导入失败明细
-- `import_log.jsonl`：每个功能节点的运行日志
-
-## 使用 Codex 生成内容
-
-如果你没有 OpenAI API key，可以让 Codex 在当前会话里生成解释 JSON，然后由脚本从互联网获取图片并导入 Anki。
-
-流程：
-
-1. 把单词列表发给 Codex。
-2. Codex 会为每个词生成解释 JSON，保存到当前项目。
-3. 脚本会按 `anki_config.json` 从互联网获取图片，存到 `generated_images/` 并导入 Anki 媒体库。
-4. Codex 调用：
-
-```bash
-python3 ankimaker.py --entries-json generated_entries.json --config anki_config.json
-```
-
-这个模式不需要 `OPENAI_API_KEY`。
-
-预生成 JSON 的单词条目格式：
-
-```json
-[
-  {
-    "word": "abandon",
-    "phonetic": "UK /əˈbændən/ US /əˈbændən/",
-    "meanings_image": [
-      {
-        "meaning": "v. 放弃，抛弃",
-        "image_memory": "一个人把沉重的背包丢在路边，轻装继续往前走。"
-      }
-    ],
-    "related_words": ["abandoned adj. 被遗弃的", "abandonment n. 放弃；遗弃"],
-    "collocations": [
-      {
-        "phrase": "abandon a plan",
-        "translation": "放弃计划",
-        "example": "They abandoned the plan after the storm."
-      }
-    ],
-    "memory_method": "a + bandon 可联想为把一堆负担丢掉，核心义是“放弃/抛弃”。"
-  }
-]
-```
-
-## 让脚本直连 OpenAI 使用
+## 让脚本直连大模型使用
 
 直接输入单词：
 
@@ -185,7 +98,8 @@ inevitable；subtle
 
 ```bash
 export ANKI_CONNECT_URL="http://127.0.0.1:8765"
-export OPENAI_MODEL="gpt-4.1-mini"
+export LLM_PROVIDER="doubao"
+export DOUBAO_MODEL="doubao-seed-2-0-lite-260428"
 export ANKI_DECK="English::AI Words"
 export ANKI_NOTE_TYPE="AI English Word"
 ```
