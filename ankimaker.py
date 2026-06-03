@@ -1124,7 +1124,21 @@ def run_threaded_mode(
             if args.dry_run:
                 logger.emit("dry_run_skip_import", "ok", entry["word"])
                 result["anki_status"] = "dry_run"
+                import_success.append(success_summary_line(entry["word"], result["ai_status"], "dry_run", "dry_run", ""))
+                import_success_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": entry["word"],
+                        "ai_status": result["ai_status"],
+                        "anki_status": "dry_run",
+                        "action": "dry_run",
+                        "note_id": "",
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
                 log_final_word(result, "dry_run", reason=result.get("reason", ""))
+                flush_outputs()
                 continue
 
             if entry.get("image_file"):
@@ -1511,6 +1525,19 @@ def main() -> int:
             if args.dry_run:
                 logger.emit("dry_run_skip_import", "ok", entry["word"])
                 word_anki_status = "dry_run"
+                import_success.append(success_summary_line(entry["word"], word_ai_status, "dry_run", "dry_run", ""))
+                import_success_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": entry["word"],
+                        "ai_status": word_ai_status,
+                        "anki_status": "dry_run",
+                        "action": "dry_run",
+                        "note_id": "",
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
                 continue
 
             if entry.get("image_file"):

@@ -2,10 +2,10 @@
 import datetime as dt
 import html
 import json
+import re
 import sys
 import zipfile
 import threading
-from xml.etree import ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -49,26 +49,24 @@ def xlsx_col_name(index: int) -> str:
 
 
 def _read_xlsx_sheet(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    namespace = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     with zipfile.ZipFile(path, "r") as archive:
-        sheet_xml = archive.read("xl/worksheets/sheet1.xml")
-    root = ET.fromstring(sheet_xml)
-    rows = root.find("main:sheetData", namespace)
-    if rows is None:
-        return [], []
+        sheet_xml = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
 
     parsed_headers: list[str] = []
     parsed_rows: list[dict[str, str]] = []
 
-    for row_index, row in enumerate(rows.findall("main:row", namespace), start=1):
+    row_matches = re.findall(r"<row\b[^>]*>(.*?)</row>", sheet_xml, flags=re.DOTALL)
+    for row_index, row_xml in enumerate(row_matches, start=1):
         values: list[str] = []
-        for cell in row.findall("main:c", namespace):
-            cell_type = cell.attrib.get("t", "")
-            if cell_type == "inlineStr":
-                text = cell.findtext("main:is/main:t", default="", namespaces=namespace)
+        cell_matches = re.findall(r"<c\b[^>]*>(.*?)</c>", row_xml, flags=re.DOTALL)
+        for cell_xml in cell_matches:
+            text_matches = re.findall(r"<t\b[^>]*>(.*?)</t>", cell_xml, flags=re.DOTALL)
+            if text_matches:
+                text = "".join(text_matches)
             else:
-                text = cell.findtext("main:v", default="", namespaces=namespace)
-            values.append(text or "")
+                value_match = re.search(r"<v\b[^>]*>(.*?)</v>", cell_xml, flags=re.DOTALL)
+                text = value_match.group(1) if value_match else ""
+            values.append(html.unescape(text))
         if row_index == 1:
             parsed_headers = values
             continue
