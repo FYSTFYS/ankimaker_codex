@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 import json
 import os
@@ -39,7 +40,7 @@ DEFAULT_WORD_PROMPT = """
   - word：单词原形
   - phonetic：音标
   - meanings_image：常见释义及图片记忆，至少 2 项
-  - related_words：相关词汇
+  - related_words：相关词汇数组，每项必须是对象，格式为 {"word":"...","pos":"...","meaning":"..."}
   - collocations：地道用法/固定搭配
   - memory_method：记忆方法
 - 内容要短、清楚、适合记忆
@@ -387,7 +388,21 @@ def normalize_entry(entry: dict[str, Any], word: str) -> dict[str, Any]:
     normalized["word"] = str(normalized.get("word") or word).strip() or word
     normalized["phonetic"] = str(normalized.get("phonetic") or "").strip()
     normalized["meanings_image"] = normalize_meanings_image(normalized.get("meanings_image"))
-    normalized["related_words"] = [str(item).strip() for item in coerce_list(normalized.get("related_words")) if str(item).strip()]
+    normalized["related_words"] = [
+        {
+            "word": str(item.get("word") or item.get("term") or item.get("related_word") or "").strip(),
+            "pos": str(item.get("pos") or item.get("part_of_speech") or "").strip(),
+            "meaning": str(item.get("meaning") or item.get("translation") or "").strip(),
+        }
+        if isinstance(item, dict)
+        else {
+            "word": str(item).strip(),
+            "pos": "",
+            "meaning": "",
+        }
+        for item in coerce_list(normalized.get("related_words"))
+        if str(item).strip()
+    ]
     normalized["collocations"] = [
         (
             {
@@ -601,8 +616,18 @@ def store_anki_media_from_path(path: str) -> str:
     return store_anki_media(filename, image_bytes)
 
 
-def html_list(items: list[str]) -> str:
-    return "<ul>" + "".join(f"<li>{html.escape(item)}</li>" for item in items) + "</ul>"
+def html_list(items: list[Any]) -> str:
+    rows = []
+    for item in items:
+        if isinstance(item, dict):
+            word = html.escape(str(item.get("word") or item.get("term") or item.get("related_word") or ""))
+            pos = html.escape(str(item.get("pos") or item.get("part_of_speech") or ""))
+            meaning = html.escape(str(item.get("meaning") or item.get("translation") or ""))
+            detail = " ".join(part for part in [word, f"[{pos}]" if pos else "", meaning] if part)
+            rows.append(f"<li>{detail}</li>")
+        else:
+            rows.append(f"<li>{html.escape(str(item))}</li>")
+    return "<ul>" + "".join(rows) + "</ul>"
 
 
 def html_meanings(items: list[dict[str, str]]) -> str:
@@ -781,6 +806,438 @@ def failed_summary_line(word: str, ai_status: str, anki_status: str, reason: str
     return "\t".join([word, f"AI={ai_status}", f"ANKI={anki_status}", reason])
 
 
+def print_word_log_block(stage: str, index: int, total: int, word: str, detail: str = "") -> None:
+    line = "=" * 88
+    print(line, file=sys.stderr, flush=True)
+    message = f"[{index}/{total}] {stage}: {word}"
+    if detail:
+        message += f" | {detail}"
+    print(message, file=sys.stderr, flush=True)
+
+
+def print_run_log_block(title: str, detail: str = "") -> None:
+    line = "=" * 88
+    print(line, file=sys.stderr, flush=True)
+    print(title, file=sys.stderr, flush=True)
+    if detail:
+        print(detail, file=sys.stderr, flush=True)
+
+
+def process_word_job(
+    index: int,
+    total: int,
+    word: str,
+    entry_from_input: dict[str, Any] | None,
+    args: argparse.Namespace,
+    llm: dict[str, str],
+    image_source: str,
+) -> dict[str, Any]:
+    started_at = time.monotonic()
+    result: dict[str, Any] = {
+        "index": index,
+        "word": word,
+        "entry": None,
+        "started_at": started_at,
+        "status": "ok",
+        "ai_status": "pending",
+        "image_status": "pending",
+        "anki_status": "pending",
+        "reason": "",
+        "note_action": "",
+        "media_filename": None,
+        "elapsed": 0.0,
+    }
+    try:
+        if entry_from_input is None:
+            entry = generate_word_entry(
+                word,
+                llm["model"],
+                llm["api_url"],
+                llm["api_key"],
+                llm["prompt_template"],
+            )
+            result["ai_status"] = "success"
+        else:
+            entry = normalize_entry(entry_from_input, word)
+            result["ai_status"] = "preloaded"
+
+        result["entry"] = entry
+
+        media_filename = None
+        image_bytes = None
+        if image_source == "internet" and not entry.get("image_file") and not args.no_images:
+            try:
+                image_path, _ = download_internet_image(entry, args.image_dir)
+                media_filename = os.path.basename(image_path)
+                result["image_status"] = "ok"
+            except Exception as exc:
+                result["image_status"] = "skipped"
+                result["reason"] = str(exc)
+        elif entry.get("image_file"):
+            media_filename = os.path.basename(entry["image_file"])
+            result["image_status"] = "preloaded"
+        elif not args.no_images:
+            try:
+                image_bytes = generate_memory_image(
+                    entry,
+                    args.image_model,
+                    args.image_size,
+                    args.image_quality,
+                )
+                image_path = save_image_file(args.image_dir, entry["word"], image_bytes)
+                media_filename = os.path.basename(image_path)
+                entry["image_file"] = image_path
+                result["image_status"] = "ok"
+            except Exception as exc:
+                result["image_status"] = "skipped"
+                if not result["reason"]:
+                    result["reason"] = str(exc)
+        else:
+            result["image_status"] = "disabled"
+
+        result["media_filename"] = media_filename
+        result["image_bytes"] = image_bytes
+        return result
+    except NonEnglishWordError:
+        result["status"] = "failed"
+        result["ai_status"] = "failed"
+        result["anki_status"] = "not_created"
+        result["reason"] = "非英文单词"
+        return result
+    except Exception as exc:
+        result["status"] = "failed"
+        result["ai_status"] = "failed"
+        result["anki_status"] = "not_created"
+        result["reason"] = str(exc)
+        return result
+    finally:
+        result["elapsed"] = time.monotonic() - started_at
+
+
+def run_threaded_mode(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    outputs: dict[str, Any],
+    input_base_dir: Path,
+    input_stem: str | None,
+    logger: StepLogger,
+    deck: str,
+    note_type: str,
+    image_source: str,
+    llm: dict[str, str],
+    words: list[str],
+    entries_to_add: list[dict[str, Any]],
+) -> int:
+    entries: list[dict[str, Any]] = []
+    added = 0
+    import_success: list[str] = []
+    import_failed: list[str] = []
+    import_success_rows: list[dict[str, Any]] = []
+    import_failed_rows: list[dict[str, Any]] = []
+    written_success_count = 0
+    written_failed_count = 0
+    success_txt = resolve_output_path(
+        outputs.get("success_txt"),
+        "import_success.txt",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_success.txt" if input_stem else "import_success.txt",
+    )
+    success_xlsx = resolve_output_path(
+        outputs.get("success_xlsx"),
+        "import_success.xlsx",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_success.xlsx" if input_stem else "import_success.xlsx",
+    )
+    failed_txt = resolve_output_path(
+        outputs.get("failed_txt"),
+        "import_failed.txt",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_failed.txt" if input_stem else "import_failed.txt",
+    )
+    failed_xlsx = resolve_output_path(
+        outputs.get("failed_xlsx"),
+        "import_failed.xlsx",
+        input_base_dir,
+        input_stem,
+        f"{input_stem}_failed.xlsx" if input_stem else "import_failed.xlsx",
+    )
+    preview_json_path = resolve_relative_path(args.preview_json, input_base_dir) if args.preview_json else None
+    run_started_at = time.monotonic()
+    if hasattr(logger, "console"):
+        logger.console = False
+
+    def flush_outputs() -> None:
+        nonlocal written_success_count, written_failed_count
+        logger.emit("write_import_success_txt", "running", "", str(success_txt))
+        write_text(success_txt, import_success[written_success_count:])
+        logger.emit("write_import_success_xlsx", "running", "", str(success_xlsx))
+        write_xlsx(
+            success_xlsx,
+            "ImportSuccess",
+            ["timestamp", "word", "ai_status", "anki_status", "action", "note_id", "deck", "note_type"],
+            import_success_rows[written_success_count:],
+        )
+        logger.emit("write_import_failed_txt", "running", "", str(failed_txt))
+        write_text(failed_txt, import_failed[written_failed_count:])
+        logger.emit("write_import_failed_xlsx", "running", "", str(failed_xlsx))
+        write_xlsx(
+            failed_xlsx,
+            "ImportFailed",
+            ["timestamp", "word", "ai_status", "anki_status", "stage", "error_type", "error_message", "deck", "note_type"],
+            import_failed_rows[written_failed_count:],
+        )
+        written_success_count = len(import_success)
+        written_failed_count = len(import_failed)
+
+    def log_final_word(result: dict[str, Any], anki_status: str, action: str = "", reason: str = "") -> None:
+        elapsed = time.monotonic() - result["started_at"]
+        summary = f"AI={result['ai_status']} IMAGE={result['image_status']} ANKI={anki_status}"
+        if action:
+            summary += f" ACTION={action}"
+        if reason:
+            summary += f" REASON={reason}"
+        summary += f" ELAPSED={elapsed:.1f}s"
+        print_word_log_block("END", result["index"], total, result["word"], summary)
+        logger.emit("word_end", "ok", result["word"], summary)
+
+    def log_ready_word(result: dict[str, Any], completed: int, pending_total: int) -> None:
+        summary = (
+            f"progress={completed}/{pending_total} "
+            f"AI={result['ai_status']} IMAGE={result['image_status']} "
+            f"WORKER={result['status']} ELAPSED={result['elapsed']:.1f}s"
+        )
+        if result.get("reason"):
+            summary += f" NOTE={result['reason']}"
+        print_word_log_block("READY", result["index"], total, result["word"], summary)
+        logger.emit("word_ready", result["status"], result["word"], summary)
+
+    print_run_log_block(
+        "RUN START",
+        f"total={len(words)} deck={deck} note_type={note_type} source={'entries_json' if args.entries_json else 'words'} threads={args.threads}",
+    )
+
+    pending_jobs: list[dict[str, Any]] = []
+    total = len(words)
+    for index, word in enumerate(words, start=1):
+        if not args.entries_json:
+            existing_note_ids = existing_note_ids_for_word(deck, note_type, word, config)
+            if existing_note_ids:
+                reason = "Anki 已存在该单词"
+                logger.emit("precheck_duplicate", "skipped", word, reason)
+                print_word_log_block("SKIP", index, total, word, reason)
+                import_failed.append(failed_summary_line(word, "not_created", "duplicate", reason))
+                import_failed_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": word,
+                        "ai_status": "not_created",
+                        "anki_status": "duplicate",
+                        "stage": "precheck_duplicate",
+                        "error_type": "DuplicateNoteError",
+                        "error_message": reason,
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                continue
+
+        entry_from_input = entries_to_add[index - 1] if args.entries_json else None
+        pending_jobs.append({"index": index, "word": word, "entry": entry_from_input})
+
+    if not pending_jobs:
+        flush_outputs()
+        if preview_json_path:
+            logger.emit("write_preview_json", "running", "", str(preview_json_path))
+            write_preview(str(preview_json_path), entries)
+        print_run_log_block(
+            "RUN END",
+            f"entries={len(entries)} imported={added} failed={len(import_failed)} elapsed={time.monotonic() - run_started_at:.1f}s",
+        )
+        logger.emit("run_done", "ok", "", f"entries={len(entries)} imported={added} failed={len(import_failed)}")
+        return 0
+
+    print_run_log_block(
+        "THREAD WORKERS START",
+        f"pending={len(pending_jobs)} threads={args.threads} ai_and_image=parallel anki_write=serial",
+    )
+    logger.emit(
+        "thread_workers_start",
+        "running",
+        "",
+        f"pending={len(pending_jobs)} threads={args.threads} anki_write=serial",
+    )
+
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = [
+            executor.submit(
+                process_word_job,
+                job["index"],
+                total,
+                job["word"],
+                job["entry"],
+                args,
+                llm,
+                image_source,
+            )
+            for job in pending_jobs
+        ]
+
+        completed_jobs = 0
+        for future in as_completed(futures):
+            result = future.result()
+            completed_jobs += 1
+            log_ready_word(result, completed_jobs, len(pending_jobs))
+            entry = result["entry"]
+            if result["status"] != "ok" or entry is None:
+                import_failed.append(
+                    failed_summary_line(
+                        result["word"],
+                        result.get("ai_status", "failed"),
+                        result.get("anki_status", "not_created"),
+                        result.get("reason", "unknown error"),
+                    )
+                )
+                import_failed_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": result["word"],
+                        "ai_status": result.get("ai_status", "failed"),
+                        "anki_status": result.get("anki_status", "not_created"),
+                        "stage": "generate_entry",
+                        "error_type": "NonEnglishWordError" if result.get("reason") == "非英文单词" else "WorkerError",
+                        "error_message": result.get("reason", "unknown error"),
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                flush_outputs()
+                log_final_word(result, result.get("anki_status", "not_created"), reason=result.get("reason", "unknown error"))
+                continue
+
+            entries.append(entry)
+            media_filename = result.get("media_filename")
+            image_bytes = result.get("image_bytes")
+
+            if args.dry_run:
+                logger.emit("dry_run_skip_import", "ok", entry["word"])
+                result["anki_status"] = "dry_run"
+                log_final_word(result, "dry_run", reason=result.get("reason", ""))
+                continue
+
+            if entry.get("image_file"):
+                try:
+                    logger.emit("store_media", "running", entry["word"], entry["image_file"])
+                    media_filename = store_anki_media_from_path(entry["image_file"])
+                    logger.emit("store_media", "ok", entry["word"], media_filename)
+                except RuntimeError as exc:
+                    reason = str(exc)
+                    result["anki_status"] = "failed"
+                    import_failed.append(failed_summary_line(entry["word"], "success", "failed", reason))
+                    import_failed_rows.append(
+                        {
+                            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                            "word": entry["word"],
+                            "ai_status": "success",
+                            "anki_status": "failed",
+                            "stage": "store_media",
+                            "error_type": type(exc).__name__,
+                            "error_message": reason,
+                            "deck": deck,
+                            "note_type": note_type,
+                        }
+                    )
+                    logger.emit("store_media", "failed", entry["word"], reason)
+                    flush_outputs()
+                    log_final_word(result, "failed", reason=reason)
+                    continue
+            elif media_filename and image_bytes:
+                try:
+                    logger.emit("store_media", "running", entry["word"], media_filename)
+                    store_anki_media(media_filename, image_bytes)
+                    logger.emit("store_media", "ok", entry["word"], media_filename)
+                except RuntimeError as exc:
+                    reason = str(exc)
+                    result["anki_status"] = "failed"
+                    import_failed.append(failed_summary_line(entry["word"], "success", "failed", reason))
+                    import_failed_rows.append(
+                        {
+                            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                            "word": entry["word"],
+                            "ai_status": "success",
+                            "anki_status": "failed",
+                            "stage": "store_media",
+                            "error_type": type(exc).__name__,
+                            "error_message": reason,
+                            "deck": deck,
+                            "note_type": note_type,
+                        }
+                    )
+                    logger.emit("store_media", "failed", entry["word"], reason)
+                    flush_outputs()
+                    log_final_word(result, "failed", reason=reason)
+                    continue
+
+            logger.emit("add_or_update_note", "running", entry["word"])
+            print_word_log_block("ANKI", result["index"], total, entry["word"], "writing note serially")
+            try:
+                note_id = add_note(deck, note_type, entry, args.tag, media_filename, config)
+                added += 1
+                result["anki_status"] = "success"
+                result["note_action"] = f"added note_id={note_id}"
+                import_success.append(success_summary_line(entry["word"], result["ai_status"], "success", "added", note_id))
+                import_success_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": entry["word"],
+                        "ai_status": result["ai_status"],
+                        "anki_status": "success",
+                        "action": "added",
+                        "note_id": note_id,
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                logger.emit("add_or_update_note", "ok", entry["word"])
+            except RuntimeError as exc:
+                reason = str(exc)
+                result["anki_status"] = "failed"
+                import_failed.append(failed_summary_line(entry["word"], result["ai_status"], "failed", reason))
+                import_failed_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": entry["word"],
+                        "ai_status": result["ai_status"],
+                        "anki_status": "failed",
+                        "stage": "add_or_update_note",
+                        "error_type": type(exc).__name__,
+                        "error_message": reason,
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                logger.emit("add_or_update_note", "failed", entry["word"], reason)
+
+            log_final_word(result, result["anki_status"], action=result["note_action"], reason=result.get("reason", ""))
+            flush_outputs()
+            if args.sleep:
+                time.sleep(args.sleep)
+
+    flush_outputs()
+    if preview_json_path:
+        logger.emit("write_preview_json", "running", "", str(preview_json_path))
+        write_preview(str(preview_json_path), entries)
+
+    print_run_log_block(
+        "RUN END",
+        f"entries={len(entries)} imported={added} failed={len(import_failed)} elapsed={time.monotonic() - run_started_at:.1f}s",
+    )
+    logger.emit("run_done", "ok", "", f"entries={len(entries)} imported={added} failed={len(import_failed)}")
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate AI English word cards and add them to Anki through AnkiConnect."
@@ -803,6 +1260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-quality", default="low", help="Image quality: low, medium, or high. Default: low")
     parser.add_argument("--image-dir", default="generated_images", help="Where generated PNG files are saved locally.")
     parser.add_argument("--no-images", action="store_true", help="Skip real image generation.")
+    parser.add_argument("--threads", type=int, help="Enable threaded mode with this many workers for AI and image steps.")
     parser.add_argument("--tag", action="append", default=["ai-word"], help="Anki tag. Can be repeated.")
     parser.add_argument("--dry-run", action="store_true", help="Generate entries but do not write to Anki.")
     parser.add_argument("--preview-json", help="Write generated entries to this JSON file.")
@@ -857,6 +1315,27 @@ def main() -> int:
             ensure_note_type(note_type)
             logger.emit("ensure_note_type", "ok", "", note_type)
 
+    if args.threads and args.threads > 0:
+        return run_threaded_mode(
+            args,
+            config,
+            outputs,
+            input_base_dir,
+            input_stem,
+            logger,
+            deck,
+            note_type,
+            image_source,
+            llm,
+            words,
+            entries_to_add,
+        )
+
+    print_run_log_block(
+        "RUN START",
+        f"total={len(words)} deck={deck} note_type={note_type} source={'entries_json' if args.entries_json else 'words'}",
+    )
+
     entries: list[dict[str, Any]] = []
     added = 0
     import_success: list[str] = []
@@ -894,205 +1373,260 @@ def main() -> int:
         f"{input_stem}_failed.xlsx" if input_stem else "import_failed.xlsx",
     )
     preview_json_path = resolve_relative_path(args.preview_json, input_base_dir) if args.preview_json else None
+    run_started_at = time.monotonic()
 
     for index, word in enumerate(words, start=1):
-        logger.emit("word_start", "running", word, f"{index}/{len(words)}")
-        if not args.entries_json:
-            existing_note_ids = existing_note_ids_for_word(deck, note_type, word, config)
-            if existing_note_ids:
-                reason = "Anki 已存在该单词"
-                logger.emit("precheck_duplicate", "skipped", word, reason)
-                print(f"[{index}/{len(words)}] skipped {word}: {reason}", file=sys.stderr)
-                import_failed.append(failed_summary_line(word, "not_created", "duplicate", reason))
-                import_failed_rows.append(
-                    {
-                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                        "word": word,
-                        "ai_status": "not_created",
-                        "anki_status": "duplicate",
-                        "stage": "precheck_duplicate",
-                        "error_type": "DuplicateNoteError",
-                        "error_message": reason,
-                        "deck": deck,
-                        "note_type": note_type,
-                    }
-                )
-                continue
-        if args.entries_json:
-            entry = entries_to_add[index - 1]
-        else:
-            logger.emit("generate_entry", "running", word)
-            print(f"[{index}/{len(words)}] generating {word}...", file=sys.stderr)
-            try:
-                entry = generate_word_entry(
-                    word,
-                    llm["model"],
-                    llm["api_url"],
-                    llm["api_key"],
-                    llm["prompt_template"],
-                )
-            except NonEnglishWordError:
-                logger.emit("generate_entry", "skipped", word, "非英文单词")
-                print(f"[{index}/{len(words)}] 非英文单词: {word}", file=sys.stderr)
-                import_failed.append(failed_summary_line(word, "failed", "not_created", "非英文单词"))
-                import_failed_rows.append(
-                    {
-                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                        "word": word,
-                        "ai_status": "failed",
-                        "anki_status": "not_created",
-                        "stage": "generate_entry",
-                        "error_type": "NonEnglishWordError",
-                        "error_message": "非英文单词",
-                        "deck": deck,
-                        "note_type": note_type,
-                    }
-                )
-                continue
-            except Exception as exc:
-                logger.emit("generate_entry", "failed", word, str(exc))
-                print(f"[{index}/{len(words)}] failed to generate {word}: {exc}", file=sys.stderr)
-                import_failed.append(failed_summary_line(word, "failed", "not_created", str(exc)))
-                import_failed_rows.append(
-                    {
-                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                        "word": word,
-                        "ai_status": "failed",
-                        "anki_status": "not_created",
-                        "stage": "generate_entry",
-                        "error_type": type(exc).__name__,
-                        "error_message": str(exc),
-                        "deck": deck,
-                        "note_type": note_type,
-                    }
-                )
-                continue
-            logger.emit("generate_entry", "ok", word)
-        entries.append(entry)
-
-        media_filename = None
-        if image_source == "internet" and not entry.get("image_file") and not args.no_images:
-            logger.emit("fetch_image", "running", entry["word"])
-            print(f"[{index}/{len(words)}] fetching internet image for {entry['word']}...", file=sys.stderr)
-            image_path, _ = download_internet_image(entry, args.image_dir)
-            media_filename = os.path.basename(image_path)
-            logger.emit("fetch_image", "ok", entry["word"], image_path)
-        elif args.entries_json and entry.get("image_file"):
-            media_filename = os.path.basename(entry["image_file"])
-        elif not args.no_images:
-            logger.emit("generate_image", "running", entry["word"])
-            print(f"[{index}/{len(words)}] generating image for {entry['word']}...", file=sys.stderr)
-            image_bytes = generate_memory_image(
-                entry,
-                args.image_model,
-                args.image_size,
-                args.image_quality,
-            )
-            image_path = save_image_file(args.image_dir, entry["word"], image_bytes)
-            media_filename = os.path.basename(image_path)
-            entry["image_file"] = image_path
-            logger.emit("generate_image", "ok", entry["word"], image_path)
-
-        if args.dry_run:
-            logger.emit("dry_run_skip_import", "ok", entry["word"])
-            continue
-
-        if entry.get("image_file"):
-            logger.emit("store_media", "running", entry["word"], entry["image_file"])
-            media_filename = store_anki_media_from_path(entry["image_file"])
-            logger.emit("store_media", "ok", entry["word"], media_filename)
-        elif media_filename:
-            logger.emit("store_media", "running", entry["word"], media_filename)
-            store_anki_media(media_filename, image_bytes)
-            logger.emit("store_media", "ok", entry["word"], media_filename)
-
-        logger.emit("add_or_update_note", "running", entry["word"])
-        print(f"[{index}/{len(words)}] adding {entry['word']} to Anki...", file=sys.stderr)
+        word_started_at = time.monotonic()
+        word_ai_status = "pending"
+        word_image_status = "pending"
+        word_anki_status = "pending"
+        word_note_action = ""
+        word_reason = ""
         try:
-            fields = build_configured_fields(entry, media_filename, config)
-            duplicate = config.get("duplicate_check", {})
-            duplicate_field = duplicate.get("field", "expression") if isinstance(duplicate, dict) else "expression"
-            query = (
-                f'deck:"{anki_query_escape(deck)}" '
-                f'note:"{anki_query_escape(note_type)}" '
-                f'{duplicate_field}:"{anki_query_escape(fields.get(duplicate_field, ""))}"'
-            )
-            existing_notes = invoke_anki("findNotes", {"query": query})
-            if existing_notes:
-                if args.update_existing:
-                    for note_id in existing_notes:
-                        invoke_anki("updateNoteFields", {"note": {"id": note_id, "fields": fields}})
-                        print(f"updated {entry['word']} note_id={note_id}", file=sys.stderr)
-                        import_success_rows.append(
-                            {
-                                "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                                "word": entry["word"],
-                                "ai_status": "success",
-                                "anki_status": "success",
-                                "action": "updated",
-                                "note_id": note_id,
-                                "deck": deck,
-                                "note_type": note_type,
-                            }
-                        )
-                    added += len(existing_notes)
-                    import_success.append(success_summary_line(entry["word"], "success", "success", "updated", existing_notes[-1]))
-                else:
+            print_word_log_block("START", index, len(words), word)
+            logger.emit("word_start", "running", word, f"{index}/{len(words)}")
+            if not args.entries_json:
+                existing_note_ids = existing_note_ids_for_word(deck, note_type, word, config)
+                if existing_note_ids:
                     reason = "Anki 已存在该单词"
-                    print(f"skipped {entry['word']}: {reason}", file=sys.stderr)
-                    import_failed.append(failed_summary_line(entry["word"], "success", "duplicate", reason))
+                    logger.emit("precheck_duplicate", "skipped", word, reason)
+                    print(f"[{index}/{len(words)}] skipped {word}: {reason}", file=sys.stderr)
+                    word_ai_status = "not_created"
+                    word_anki_status = "duplicate"
+                    word_reason = reason
+                    import_failed.append(failed_summary_line(word, "not_created", "duplicate", reason))
                     import_failed_rows.append(
                         {
                             "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                            "word": entry["word"],
-                            "ai_status": "success",
+                            "word": word,
+                            "ai_status": "not_created",
                             "anki_status": "duplicate",
-                            "stage": "duplicate_check",
+                            "stage": "precheck_duplicate",
                             "error_type": "DuplicateNoteError",
                             "error_message": reason,
                             "deck": deck,
                             "note_type": note_type,
                         }
                     )
-                    logger.emit("add_or_update_note", "skipped", entry["word"], reason)
                     continue
+            if args.entries_json:
+                entry = entries_to_add[index - 1]
+                word_ai_status = "preloaded"
+                if entry.get("image_file"):
+                    word_image_status = "preloaded"
             else:
-                note_id = add_note(deck, note_type, entry, args.tag, media_filename, config)
-                added += 1
-                print(f"added {entry['word']} note_id={note_id}", file=sys.stderr)
-                import_success.append(success_summary_line(entry["word"], "success", "success", "added", note_id))
-                import_success_rows.append(
+                logger.emit("generate_entry", "running", word)
+                print(f"[{index}/{len(words)}] generating {word}...", file=sys.stderr)
+                try:
+                    entry = generate_word_entry(
+                        word,
+                        llm["model"],
+                        llm["api_url"],
+                        llm["api_key"],
+                        llm["prompt_template"],
+                    )
+                    word_ai_status = "success"
+                except NonEnglishWordError:
+                    logger.emit("generate_entry", "skipped", word, "非英文单词")
+                    print(f"[{index}/{len(words)}] 非英文单词: {word}", file=sys.stderr)
+                    word_ai_status = "failed"
+                    word_anki_status = "not_created"
+                    word_reason = "非英文单词"
+                    import_failed.append(failed_summary_line(word, "failed", "not_created", "非英文单词"))
+                    import_failed_rows.append(
+                        {
+                            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                            "word": word,
+                            "ai_status": "failed",
+                            "anki_status": "not_created",
+                            "stage": "generate_entry",
+                            "error_type": "NonEnglishWordError",
+                            "error_message": "非英文单词",
+                            "deck": deck,
+                            "note_type": note_type,
+                        }
+                    )
+                    continue
+                except Exception as exc:
+                    logger.emit("generate_entry", "failed", word, str(exc))
+                    print(f"[{index}/{len(words)}] failed to generate {word}: {exc}", file=sys.stderr)
+                    word_ai_status = "failed"
+                    word_anki_status = "not_created"
+                    word_reason = str(exc)
+                    import_failed.append(failed_summary_line(word, "failed", "not_created", str(exc)))
+                    import_failed_rows.append(
+                        {
+                            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                            "word": word,
+                            "ai_status": "failed",
+                            "anki_status": "not_created",
+                            "stage": "generate_entry",
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                            "deck": deck,
+                            "note_type": note_type,
+                        }
+                    )
+                    continue
+                logger.emit("generate_entry", "ok", word)
+            entries.append(entry)
+
+            media_filename = None
+            image_bytes = None
+            if image_source == "internet" and not entry.get("image_file") and not args.no_images:
+                logger.emit("fetch_image", "running", entry["word"])
+                print(f"[{index}/{len(words)}] fetching internet image for {entry['word']}...", file=sys.stderr)
+                try:
+                    image_path, _ = download_internet_image(entry, args.image_dir)
+                    media_filename = os.path.basename(image_path)
+                    logger.emit("fetch_image", "ok", entry["word"], image_path)
+                except Exception as exc:
+                    logger.emit("fetch_image", "skipped", entry["word"], str(exc))
+                    print(f"[{index}/{len(words)}] skip image for {entry['word']}: {exc}", file=sys.stderr)
+            elif args.entries_json and entry.get("image_file"):
+                media_filename = os.path.basename(entry["image_file"])
+            elif not args.no_images:
+                logger.emit("generate_image", "running", entry["word"])
+                print(f"[{index}/{len(words)}] generating image for {entry['word']}...", file=sys.stderr)
+                try:
+                    image_bytes = generate_memory_image(
+                        entry,
+                        args.image_model,
+                        args.image_size,
+                        args.image_quality,
+                    )
+                    image_path = save_image_file(args.image_dir, entry["word"], image_bytes)
+                    media_filename = os.path.basename(image_path)
+                    entry["image_file"] = image_path
+                    logger.emit("generate_image", "ok", entry["word"], image_path)
+                    word_image_status = "ok"
+                except Exception as exc:
+                    logger.emit("generate_image", "skipped", entry["word"], str(exc))
+                    print(f"[{index}/{len(words)}] skip image for {entry['word']}: {exc}", file=sys.stderr)
+                    word_image_status = "skipped"
+                    word_reason = str(exc) if not word_reason else word_reason
+            else:
+                word_image_status = "disabled"
+
+            if args.dry_run:
+                logger.emit("dry_run_skip_import", "ok", entry["word"])
+                word_anki_status = "dry_run"
+                continue
+
+            if entry.get("image_file"):
+                logger.emit("store_media", "running", entry["word"], entry["image_file"])
+                media_filename = store_anki_media_from_path(entry["image_file"])
+                logger.emit("store_media", "ok", entry["word"], media_filename)
+            elif media_filename and image_bytes:
+                logger.emit("store_media", "running", entry["word"], media_filename)
+                store_anki_media(media_filename, image_bytes)
+                logger.emit("store_media", "ok", entry["word"], media_filename)
+
+            logger.emit("add_or_update_note", "running", entry["word"])
+            print(f"[{index}/{len(words)}] adding {entry['word']} to Anki...", file=sys.stderr)
+            try:
+                fields = build_configured_fields(entry, media_filename, config)
+                duplicate = config.get("duplicate_check", {})
+                duplicate_field = duplicate.get("field", "expression") if isinstance(duplicate, dict) else "expression"
+                query = (
+                    f'deck:"{anki_query_escape(deck)}" '
+                    f'note:"{anki_query_escape(note_type)}" '
+                    f'{duplicate_field}:"{anki_query_escape(fields.get(duplicate_field, ""))}"'
+                )
+                existing_notes = invoke_anki("findNotes", {"query": query})
+                if existing_notes:
+                    if args.update_existing:
+                        for note_id in existing_notes:
+                            invoke_anki("updateNoteFields", {"note": {"id": note_id, "fields": fields}})
+                            print(f"updated {entry['word']} note_id={note_id}", file=sys.stderr)
+                            word_anki_status = "updated"
+                            word_note_action = "updated"
+                            import_success_rows.append(
+                                {
+                                    "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                                    "word": entry["word"],
+                                    "ai_status": "success",
+                                    "anki_status": "success",
+                                    "action": "updated",
+                                    "note_id": note_id,
+                                    "deck": deck,
+                                    "note_type": note_type,
+                                }
+                            )
+                        added += len(existing_notes)
+                        import_success.append(success_summary_line(entry["word"], "success", "success", "updated", existing_notes[-1]))
+                    else:
+                        reason = "Anki 已存在该单词"
+                        print(f"skipped {entry['word']}: {reason}", file=sys.stderr)
+                        word_anki_status = "duplicate"
+                        word_reason = reason
+                        import_failed.append(failed_summary_line(entry["word"], "success", "duplicate", reason))
+                        import_failed_rows.append(
+                            {
+                                "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                                "word": entry["word"],
+                                "ai_status": "success",
+                                "anki_status": "duplicate",
+                                "stage": "duplicate_check",
+                                "error_type": "DuplicateNoteError",
+                                "error_message": reason,
+                                "deck": deck,
+                                "note_type": note_type,
+                            }
+                        )
+                        logger.emit("add_or_update_note", "skipped", entry["word"], reason)
+                        continue
+                else:
+                    note_id = add_note(deck, note_type, entry, args.tag, media_filename, config)
+                    added += 1
+                    print(f"added {entry['word']} note_id={note_id}", file=sys.stderr)
+                    word_anki_status = "success"
+                    word_note_action = "added"
+                    import_success.append(success_summary_line(entry["word"], "success", "success", "added", note_id))
+                    import_success_rows.append(
+                        {
+                            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                            "word": entry["word"],
+                            "ai_status": "success",
+                            "anki_status": "success",
+                            "action": "added",
+                            "note_id": note_id,
+                            "deck": deck,
+                            "note_type": note_type,
+                        }
+                    )
+                logger.emit("add_or_update_note", "ok", entry["word"])
+            except RuntimeError as exc:
+                print(f"skipped {entry['word']}: {exc}", file=sys.stderr)
+                word_anki_status = "failed"
+                word_reason = str(exc)
+                import_failed.append(failed_summary_line(entry["word"], "success", "failed", str(exc)))
+                import_failed_rows.append(
                     {
                         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                         "word": entry["word"],
                         "ai_status": "success",
-                        "anki_status": "success",
-                        "action": "added",
-                        "note_id": note_id,
+                        "anki_status": "failed",
+                        "stage": "add_or_update_note",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
                         "deck": deck,
                         "note_type": note_type,
                     }
                 )
-            logger.emit("add_or_update_note", "ok", entry["word"])
-        except RuntimeError as exc:
-            print(f"skipped {entry['word']}: {exc}", file=sys.stderr)
-            import_failed.append(failed_summary_line(entry["word"], "success", "failed", str(exc)))
-            import_failed_rows.append(
-                {
-                    "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                    "word": entry["word"],
-                    "ai_status": "success",
-                    "anki_status": "failed",
-                    "stage": "add_or_update_note",
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                    "deck": deck,
-                    "note_type": note_type,
-                }
-            )
-            logger.emit("add_or_update_note", "failed", entry["word"], str(exc))
-        if args.sleep:
-            time.sleep(args.sleep)
+                logger.emit("add_or_update_note", "failed", entry["word"], str(exc))
+            if args.sleep:
+                time.sleep(args.sleep)
+        finally:
+            elapsed = time.monotonic() - word_started_at
+            summary = f"AI={word_ai_status} IMAGE={word_image_status} ANKI={word_anki_status}"
+            if word_note_action:
+                summary += f" ACTION={word_note_action}"
+            if word_reason:
+                summary += f" REASON={word_reason}"
+            summary += f" ELAPSED={elapsed:.1f}s"
+            print_word_log_block("END", index, len(words), word, summary)
+            logger.emit("word_end", "ok", word, summary)
 
         logger.emit("write_import_success_txt", "running", "", str(success_txt))
         write_text(success_txt, import_success[written_success_count:])
@@ -1123,6 +1657,10 @@ def main() -> int:
         print(json.dumps(entries, ensure_ascii=False, indent=2))
     else:
         print(f"Done. Generated {len(entries)} entries, added {added} notes to {deck}.")
+    print_run_log_block(
+        "RUN END",
+        f"entries={len(entries)} imported={added} failed={len(import_failed)} elapsed={time.monotonic() - run_started_at:.1f}s",
+    )
     logger.emit("run_done", "ok", "", f"entries={len(entries)} imported={added} failed={len(import_failed)}")
     return 0
 

@@ -4,14 +4,17 @@ import html
 import json
 import sys
 import zipfile
+import threading
 from xml.etree import ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 
 class StepLogger:
-    def __init__(self, log_path: Path | None = None) -> None:
+    def __init__(self, log_path: Path | None = None, console: bool = True) -> None:
         self.log_path = log_path
+        self.console = console
+        self._lock = threading.Lock()
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -29,10 +32,12 @@ class StepLogger:
             line += f" word={word}"
         if detail:
             line += f" detail={detail}"
-        print(line, file=sys.stderr, flush=True)
-        if self.log_path:
-            with self.log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        with self._lock:
+            if self.console:
+                print(line, file=sys.stderr, flush=True)
+            if self.log_path:
+                with self.log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def xlsx_col_name(index: int) -> str:
