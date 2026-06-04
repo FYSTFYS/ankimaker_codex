@@ -24,12 +24,14 @@ DEFAULT_LLM_PROVIDER = os.getenv("LLM_PROVIDER", "doubao").lower()
 OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/responses")
 DOUBAO_API_URL = os.getenv("DOUBAO_API_URL", "https://ark.cn-beijing.volces.com/api/v3/responses")
 OPENAI_IMAGE_API_URL = os.getenv("OPENAI_IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
+PIXABAY_API_URL = os.getenv("PIXABAY_API_URL", "https://pixabay.com/api/")
 DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 DEFAULT_DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-seed-2-0-lite-260428")
 DEFAULT_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 DEFAULT_DECK = os.getenv("ANKI_DECK", "English::AI Words")
 DEFAULT_NOTE_TYPE = os.getenv("ANKI_NOTE_TYPE", "AI English Word")
 DEFAULT_CONFIG = "anki_config.json"
+DEFAULT_INTERNET_IMAGE_LIMIT = 3
 DEFAULT_WORD_PROMPT = """
 我要你帮我记忆单词，我给出一个单词：{word}
 
@@ -304,6 +306,28 @@ def resolve_llm_api_key(provider: str, llm_config: dict[str, Any]) -> str:
     raise RuntimeError(f"{expected} is not set.")
 
 
+def resolve_image_settings(config: dict[str, Any]) -> dict[str, Any]:
+    image_config = config.get("image", {})
+    configured_limit = image_config.get("per_word_limit", DEFAULT_INTERNET_IMAGE_LIMIT)
+    configured_per_page = image_config.get("per_page", DEFAULT_INTERNET_IMAGE_LIMIT)
+    try:
+        limit = int(configured_limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_INTERNET_IMAGE_LIMIT
+    try:
+        per_page = int(configured_per_page)
+    except (TypeError, ValueError):
+        per_page = DEFAULT_INTERNET_IMAGE_LIMIT
+
+    return {
+        "source": str(image_config.get("source") or "generated"),
+        "provider": str(image_config.get("provider") or "pixabay").lower(),
+        "api_key": str(image_config.get("api_key") or os.getenv("PIXABAY_API_KEY") or "").strip(),
+        "per_word_limit": max(1, min(limit, DEFAULT_INTERNET_IMAGE_LIMIT)),
+        "per_page": max(3, per_page),
+    }
+
+
 def read_words(args: argparse.Namespace) -> list[str]:
     if args.entries_json:
         return []
@@ -421,6 +445,13 @@ def normalize_entry(entry: dict[str, Any], word: str) -> dict[str, Any]:
         if str(item).strip()
     ]
     normalized["memory_method"] = str(normalized.get("memory_method") or "").strip()
+    image_files = normalized.get("image_files")
+    if isinstance(image_files, list):
+        normalized["image_files"] = [str(item).strip() for item in image_files if str(item).strip()]
+    elif normalized.get("image_file"):
+        normalized["image_files"] = [str(normalized["image_file"]).strip()]
+    else:
+        normalized["image_files"] = []
     return normalized
 
 
@@ -539,59 +570,99 @@ def generate_memory_image(entry: dict[str, Any], image_model: str, image_size: s
     return base64.b64decode(data[0]["b64_json"])
 
 
-def find_wikimedia_image(word: str) -> dict[str, str] | None:
+def find_pixabay_images(word: str, api_key: str, limit: int, per_page: int) -> list[dict[str, str]]:
+    if not api_key:
+        raise RuntimeError("Pixabay API key is not configured.")
+
     query = urllib.parse.urlencode(
         {
-            "action": "query",
-            "format": "json",
-            "generator": "search",
-            "gsrnamespace": 6,
-            "gsrsearch": f"{word} filetype:bitmap",
-            "gsrlimit": 10,
-            "prop": "imageinfo",
-            "iiprop": "url|mime|extmetadata",
-            "iiurlwidth": 900,
+            "key": api_key,
+            "q": word,
+            "image_type": "photo",
+            "safesearch": "true",
+            "order": "popular",
+            "per_page": per_page,
         }
     )
-    data = fetch_json(f"https://commons.wikimedia.org/w/api.php?{query}")
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        imageinfo = (page.get("imageinfo") or [{}])[0]
-        mime = imageinfo.get("mime", "")
-        url = imageinfo.get("thumburl") or imageinfo.get("url")
-        if not url or not mime.startswith("image/"):
+    data = fetch_json(f"{PIXABAY_API_URL}?{query}")
+    hits = data.get("hits") or []
+    results: list[dict[str, str]] = []
+    for hit in hits[:limit]:
+        url = hit.get("largeImageURL") or hit.get("webformatURL") or hit.get("previewURL")
+        if not url:
             continue
-        metadata = imageinfo.get("extmetadata") or {}
-        license_short = metadata.get("LicenseShortName", {}).get("value", "")
-        artist = re.sub(r"<[^>]+>", "", metadata.get("Artist", {}).get("value", ""))
-        credit = "Wikimedia Commons"
-        if license_short:
-            credit += f", {license_short}"
-        if artist:
-            credit += f", {artist[:80]}"
-        return {
-            "url": url,
-            "source_page": imageinfo.get("descriptionurl", ""),
-            "credit": credit,
-        }
-    return None
+        user = str(hit.get("user") or "").strip()
+        credit = "Pixabay"
+        if user:
+            credit += f", by {user}"
+        results.append(
+            {
+                "url": str(url),
+                "source_page": str(hit.get("pageURL") or url),
+                "credit": credit,
+            }
+        )
+    return results
 
 
-def download_internet_image(entry: dict[str, Any], image_dir: str) -> tuple[str, str]:
-    result = find_wikimedia_image(entry["word"])
-    if not result:
-        raise RuntimeError(f"No Wikimedia image found for {entry['word']!r}.")
-    image_bytes = fetch_bytes(result["url"])
-    path = save_image_file(image_dir, entry["word"], image_bytes)
-    entry["image_file"] = path
-    entry["image_source_url"] = result["source_page"] or result["url"]
-    entry["image_credit"] = result["credit"]
-    return path, result["source_page"] or result["url"]
+def image_extension_from_url(url: str, default: str = ".jpg") -> str:
+    suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+        return suffix
+    return default
 
 
-def save_image_file(image_dir: str, word: str, image_bytes: bytes) -> str:
+def download_internet_images(
+    entry: dict[str, Any],
+    image_dir: str,
+    provider: str,
+    api_key: str,
+    limit: int,
+    per_page: int,
+) -> tuple[list[str], list[str]]:
+    if provider != "pixabay":
+        raise RuntimeError(f"Unsupported internet image provider: {provider}")
+
+    results = find_pixabay_images(entry["word"], api_key, limit, per_page)
+    if not results:
+        raise RuntimeError(f"No Pixabay image found for {entry['word']!r}.")
+
+    paths: list[str] = []
+    source_urls: list[str] = []
+    credits: list[str] = []
+    for index, result in enumerate(results, start=1):
+        image_bytes = fetch_bytes(result["url"])
+        path = save_image_file(
+            image_dir,
+            entry["word"],
+            image_bytes,
+            index=index,
+            extension=image_extension_from_url(result["url"]),
+        )
+        paths.append(path)
+        source_urls.append(result["source_page"] or result["url"])
+        credits.append(result["credit"])
+
+    entry["image_files"] = paths
+    entry["image_file"] = paths[0]
+    entry["image_source_urls"] = source_urls
+    entry["image_source_url"] = "\n".join(source_urls)
+    entry["image_credits"] = credits
+    entry["image_credit"] = credits[0] if credits else ""
+    return paths, source_urls
+
+
+def save_image_file(
+    image_dir: str,
+    word: str,
+    image_bytes: bytes,
+    *,
+    index: int | None = None,
+    extension: str = ".png",
+) -> str:
     os.makedirs(image_dir, exist_ok=True)
-    filename = f"aiword-{slugify(word)}.png"
+    suffix = f"-{index}" if index is not None else ""
+    filename = f"aiword-{slugify(word)}{suffix}{extension}"
     path = os.path.join(image_dir, filename)
     with open(path, "wb") as handle:
         handle.write(image_bytes)
@@ -614,6 +685,20 @@ def store_anki_media_from_path(path: str) -> str:
         image_bytes = handle.read()
     filename = os.path.basename(path)
     return store_anki_media(filename, image_bytes)
+
+
+def store_anki_media_from_paths(paths: list[str]) -> list[str]:
+    return [store_anki_media_from_path(path) for path in paths]
+
+
+def get_image_paths(entry: dict[str, Any]) -> list[str]:
+    image_files = entry.get("image_files")
+    if isinstance(image_files, list):
+        paths = [str(path).strip() for path in image_files if str(path).strip()]
+        if paths:
+            return paths
+    image_file = str(entry.get("image_file") or "").strip()
+    return [image_file] if image_file else []
 
 
 def html_list(items: list[Any]) -> str:
@@ -649,20 +734,34 @@ def html_collocations(items: list[dict[str, str]]) -> str:
     return "<ul>" + "".join(rows) + "</ul>"
 
 
-def render_full_note(entry: dict[str, Any], media_filename: str | None) -> str:
+def render_image_gallery(entry: dict[str, Any], media_filenames: list[str]) -> str:
+    parts: list[str] = []
+    credits = entry.get("image_credits")
+    if not isinstance(credits, list):
+        credits = []
+
+    for index, media_filename in enumerate(media_filenames):
+        safe_filename = html.escape(media_filename, quote=True)
+        parts.append(
+            f'<img src="{safe_filename}" alt="{html.escape(entry["word"], quote=True)} mnemonic {index + 1}" style="max-width:100%;">'
+        )
+        credit = ""
+        if index < len(credits):
+            credit = str(credits[index]).strip()
+        elif index == 0:
+            credit = str(entry.get("image_credit") or "").strip()
+        if credit:
+            parts.append(f'<div style="font-size:12px;color:#777;">{html.escape(credit)}</div>')
+    return "<br>".join(parts)
+
+
+def render_full_note(entry: dict[str, Any], media_filenames: list[str]) -> str:
     if entry.get("note_html"):
         return entry["note_html"]
 
-    image_html = ""
-    if media_filename:
-        safe_filename = html.escape(media_filename, quote=True)
-        image_html = f'<img src="{safe_filename}" alt="{html.escape(entry["word"], quote=True)} mnemonic" style="max-width:100%;">'
-        if entry.get("image_credit"):
-            image_html += f'<div style="font-size:12px;color:#777;">{html.escape(entry["image_credit"])}</div>'
-
     parts = []
-    if image_html:
-        parts.append(image_html)
+    if media_filenames:
+        parts.append(render_image_gallery(entry, media_filenames))
     parts.extend(
         [
             '<div><b>常见含义和图片记忆</b></div>',
@@ -685,11 +784,11 @@ def render_sentences(entry: dict[str, Any]) -> str:
     )
 
 
-def build_ai_fields(entry: dict[str, Any], media_filename: str | None) -> dict[str, str]:
+def build_ai_fields(entry: dict[str, Any], media_filenames: list[str]) -> dict[str, str]:
     return {
         "Word": html.escape(entry["word"]),
         "Phonetic": html.escape(entry["phonetic"]),
-        "MemoryImage": render_full_note(entry, media_filename).split("<br>", 1)[0] if media_filename else "",
+        "MemoryImage": render_image_gallery(entry, media_filenames) if media_filenames else "",
         "MeaningsImage": html_meanings(entry["meanings_image"]),
         "RelatedWords": html_list(entry["related_words"]),
         "Collocations": html_collocations(entry["collocations"]),
@@ -697,15 +796,21 @@ def build_ai_fields(entry: dict[str, Any], media_filename: str | None) -> dict[s
     }
 
 
-def build_configured_fields(entry: dict[str, Any], media_filename: str | None, config: dict[str, Any]) -> dict[str, str]:
+def build_configured_fields(entry: dict[str, Any], media_filenames: list[str], config: dict[str, Any]) -> dict[str, str]:
     field_map = config.get("field_map")
     if not field_map:
-        return build_ai_fields(entry, media_filename)
+        return build_ai_fields(entry, media_filenames)
+
+    source_urls = entry.get("image_source_urls")
+    if isinstance(source_urls, list):
+        rendered_source_urls = "<br>".join(html.escape(str(url)) for url in source_urls if str(url).strip())
+    else:
+        rendered_source_urls = html.escape(entry.get("image_source_url", ""))
 
     values = {
         "word": html.escape(entry["word"]),
         "phonetic": html.escape(entry["phonetic"]),
-        "glossary": render_full_note(entry, media_filename),
+        "glossary": render_full_note(entry, media_filenames),
         "sentences": render_sentences(entry),
         "note": "<br>".join(
             [
@@ -715,10 +820,10 @@ def build_configured_fields(entry: dict[str, Any], media_filename: str | None, c
                 html.escape(entry["memory_method"]),
             ]
         ),
-        "full_note": render_full_note(entry, media_filename),
-        "source_url": html.escape(entry.get("image_source_url", "")),
+        "full_note": render_full_note(entry, media_filenames),
+        "source_url": rendered_source_urls,
         "audio": "",
-        "image": f'<img src="{html.escape(media_filename, quote=True)}">' if media_filename else "",
+        "image": render_image_gallery(entry, media_filenames),
         "empty": "",
     }
 
@@ -765,8 +870,8 @@ def existing_note_ids_for_word(deck: str, note_type: str, word: str, config: dic
     return [int(note_id) for note_id in note_ids]
 
 
-def add_note(deck: str, note_type: str, entry: dict[str, Any], tags: list[str], media_filename: str | None, config: dict[str, Any]) -> int:
-    fields = build_configured_fields(entry, media_filename, config)
+def add_note(deck: str, note_type: str, entry: dict[str, Any], tags: list[str], media_filenames: list[str], config: dict[str, Any]) -> int:
+    fields = build_configured_fields(entry, media_filenames, config)
     if note_exists(deck, note_type, fields, config):
         raise RuntimeError(f"duplicate note found for {entry['word']!r}; skipped")
 
@@ -844,7 +949,7 @@ def process_word_job(
         "anki_status": "pending",
         "reason": "",
         "note_action": "",
-        "media_filename": None,
+        "media_filenames": [],
         "elapsed": 0.0,
     }
     try:
@@ -863,18 +968,26 @@ def process_word_job(
 
         result["entry"] = entry
 
-        media_filename = None
+        media_filenames: list[str] = []
         image_bytes = None
-        if image_source == "internet" and not entry.get("image_file") and not args.no_images:
+        image_settings = getattr(args, "image_settings", {"provider": "pixabay", "api_key": "", "per_word_limit": 3})
+        if image_source == "internet" and not get_image_paths(entry) and not args.no_images:
             try:
-                image_path, _ = download_internet_image(entry, args.image_dir)
-                media_filename = os.path.basename(image_path)
+                image_paths, _ = download_internet_images(
+                    entry,
+                    args.image_dir,
+                    image_settings["provider"],
+                    image_settings["api_key"],
+                    image_settings["per_word_limit"],
+                    image_settings["per_page"],
+                )
+                media_filenames = [os.path.basename(path) for path in image_paths]
                 result["image_status"] = "ok"
             except Exception as exc:
                 result["image_status"] = "skipped"
                 result["reason"] = str(exc)
-        elif entry.get("image_file"):
-            media_filename = os.path.basename(entry["image_file"])
+        elif get_image_paths(entry):
+            media_filenames = [os.path.basename(path) for path in get_image_paths(entry)]
             result["image_status"] = "preloaded"
         elif not args.no_images:
             try:
@@ -885,7 +998,8 @@ def process_word_job(
                     args.image_quality,
                 )
                 image_path = save_image_file(args.image_dir, entry["word"], image_bytes)
-                media_filename = os.path.basename(image_path)
+                media_filenames = [os.path.basename(image_path)]
+                entry["image_files"] = [image_path]
                 entry["image_file"] = image_path
                 result["image_status"] = "ok"
             except Exception as exc:
@@ -895,7 +1009,7 @@ def process_word_job(
         else:
             result["image_status"] = "disabled"
 
-        result["media_filename"] = media_filename
+        result["media_filenames"] = media_filenames
         result["image_bytes"] = image_bytes
         return result
     except NonEnglishWordError:
@@ -1118,7 +1232,7 @@ def run_threaded_mode(
                 continue
 
             entries.append(entry)
-            media_filename = result.get("media_filename")
+            media_filenames = result.get("media_filenames") or []
             image_bytes = result.get("image_bytes")
 
             if args.dry_run:
@@ -1141,11 +1255,12 @@ def run_threaded_mode(
                 flush_outputs()
                 continue
 
-            if entry.get("image_file"):
+            image_paths = get_image_paths(entry)
+            if image_paths:
                 try:
-                    logger.emit("store_media", "running", entry["word"], entry["image_file"])
-                    media_filename = store_anki_media_from_path(entry["image_file"])
-                    logger.emit("store_media", "ok", entry["word"], media_filename)
+                    logger.emit("store_media", "running", entry["word"], ", ".join(image_paths))
+                    media_filenames = store_anki_media_from_paths(image_paths)
+                    logger.emit("store_media", "ok", entry["word"], ", ".join(media_filenames))
                 except RuntimeError as exc:
                     reason = str(exc)
                     result["anki_status"] = "failed"
@@ -1167,11 +1282,11 @@ def run_threaded_mode(
                     flush_outputs()
                     log_final_word(result, "failed", reason=reason)
                     continue
-            elif media_filename and image_bytes:
+            elif media_filenames and image_bytes:
                 try:
-                    logger.emit("store_media", "running", entry["word"], media_filename)
-                    store_anki_media(media_filename, image_bytes)
-                    logger.emit("store_media", "ok", entry["word"], media_filename)
+                    logger.emit("store_media", "running", entry["word"], ", ".join(media_filenames))
+                    store_anki_media(media_filenames[0], image_bytes)
+                    logger.emit("store_media", "ok", entry["word"], ", ".join(media_filenames))
                 except RuntimeError as exc:
                     reason = str(exc)
                     result["anki_status"] = "failed"
@@ -1197,7 +1312,7 @@ def run_threaded_mode(
             logger.emit("add_or_update_note", "running", entry["word"])
             print_word_log_block("ANKI", result["index"], total, entry["word"], "writing note serially")
             try:
-                note_id = add_note(deck, note_type, entry, args.tag, media_filename, config)
+                note_id = add_note(deck, note_type, entry, args.tag, media_filenames, config)
                 added += 1
                 result["anki_status"] = "success"
                 result["note_action"] = f"added note_id={note_id}"
@@ -1286,6 +1401,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
+    args.image_settings = resolve_image_settings(config)
     outputs = config.get("outputs", {})
     input_base_dir = Path.cwd()
     input_stem: str | None = None
@@ -1305,7 +1421,7 @@ def main() -> int:
     logger.emit("config_loaded", "ok", "", args.config)
     deck = args.deck if args.deck != DEFAULT_DECK else config.get("deck", args.deck)
     note_type = args.note_type if args.note_type != DEFAULT_NOTE_TYPE else config.get("note_type", args.note_type)
-    image_source = config.get("image", {}).get("source", "generated")
+    image_source = args.image_settings["source"]
     llm = resolve_llm_settings(args, config)
     logger.emit("llm_config", "ok", "", f"{llm['provider']} {llm['model']}")
 
@@ -1426,7 +1542,7 @@ def main() -> int:
             if args.entries_json:
                 entry = entries_to_add[index - 1]
                 word_ai_status = "preloaded"
-                if entry.get("image_file"):
+                if get_image_paths(entry):
                     word_image_status = "preloaded"
             else:
                 logger.emit("generate_entry", "running", word)
@@ -1485,20 +1601,30 @@ def main() -> int:
                 logger.emit("generate_entry", "ok", word)
             entries.append(entry)
 
-            media_filename = None
+            media_filenames: list[str] = []
             image_bytes = None
-            if image_source == "internet" and not entry.get("image_file") and not args.no_images:
+            if image_source == "internet" and not get_image_paths(entry) and not args.no_images:
                 logger.emit("fetch_image", "running", entry["word"])
                 print(f"[{index}/{len(words)}] fetching internet image for {entry['word']}...", file=sys.stderr)
                 try:
-                    image_path, _ = download_internet_image(entry, args.image_dir)
-                    media_filename = os.path.basename(image_path)
-                    logger.emit("fetch_image", "ok", entry["word"], image_path)
+                    image_paths, _ = download_internet_images(
+                        entry,
+                        args.image_dir,
+                        args.image_settings["provider"],
+                        args.image_settings["api_key"],
+                        args.image_settings["per_word_limit"],
+                        args.image_settings["per_page"],
+                    )
+                    media_filenames = [os.path.basename(path) for path in image_paths]
+                    logger.emit("fetch_image", "ok", entry["word"], ", ".join(image_paths))
+                    word_image_status = "ok"
                 except Exception as exc:
                     logger.emit("fetch_image", "skipped", entry["word"], str(exc))
                     print(f"[{index}/{len(words)}] skip image for {entry['word']}: {exc}", file=sys.stderr)
-            elif args.entries_json and entry.get("image_file"):
-                media_filename = os.path.basename(entry["image_file"])
+                    word_image_status = "skipped"
+                    word_reason = str(exc) if not word_reason else word_reason
+            elif args.entries_json and get_image_paths(entry):
+                media_filenames = [os.path.basename(path) for path in get_image_paths(entry)]
             elif not args.no_images:
                 logger.emit("generate_image", "running", entry["word"])
                 print(f"[{index}/{len(words)}] generating image for {entry['word']}...", file=sys.stderr)
@@ -1510,7 +1636,8 @@ def main() -> int:
                         args.image_quality,
                     )
                     image_path = save_image_file(args.image_dir, entry["word"], image_bytes)
-                    media_filename = os.path.basename(image_path)
+                    media_filenames = [os.path.basename(image_path)]
+                    entry["image_files"] = [image_path]
                     entry["image_file"] = image_path
                     logger.emit("generate_image", "ok", entry["word"], image_path)
                     word_image_status = "ok"
@@ -1540,19 +1667,20 @@ def main() -> int:
                 )
                 continue
 
-            if entry.get("image_file"):
-                logger.emit("store_media", "running", entry["word"], entry["image_file"])
-                media_filename = store_anki_media_from_path(entry["image_file"])
-                logger.emit("store_media", "ok", entry["word"], media_filename)
-            elif media_filename and image_bytes:
-                logger.emit("store_media", "running", entry["word"], media_filename)
-                store_anki_media(media_filename, image_bytes)
-                logger.emit("store_media", "ok", entry["word"], media_filename)
+            image_paths = get_image_paths(entry)
+            if image_paths:
+                logger.emit("store_media", "running", entry["word"], ", ".join(image_paths))
+                media_filenames = store_anki_media_from_paths(image_paths)
+                logger.emit("store_media", "ok", entry["word"], ", ".join(media_filenames))
+            elif media_filenames and image_bytes:
+                logger.emit("store_media", "running", entry["word"], ", ".join(media_filenames))
+                store_anki_media(media_filenames[0], image_bytes)
+                logger.emit("store_media", "ok", entry["word"], ", ".join(media_filenames))
 
             logger.emit("add_or_update_note", "running", entry["word"])
             print(f"[{index}/{len(words)}] adding {entry['word']} to Anki...", file=sys.stderr)
             try:
-                fields = build_configured_fields(entry, media_filename, config)
+                fields = build_configured_fields(entry, media_filenames, config)
                 duplicate = config.get("duplicate_check", {})
                 duplicate_field = duplicate.get("field", "expression") if isinstance(duplicate, dict) else "expression"
                 query = (
@@ -1604,7 +1732,7 @@ def main() -> int:
                         logger.emit("add_or_update_note", "skipped", entry["word"], reason)
                         continue
                 else:
-                    note_id = add_note(deck, note_type, entry, args.tag, media_filename, config)
+                    note_id = add_note(deck, note_type, entry, args.tag, media_filenames, config)
                     added += 1
                     print(f"added {entry['word']} note_id={note_id}", file=sys.stderr)
                     word_anki_status = "success"

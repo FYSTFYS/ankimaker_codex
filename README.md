@@ -6,7 +6,7 @@
 
 - 目标牌组：`日常想到的`
 - 模板：`OnlineDictHelper`
-- 图片来源：互联网图片，当前使用 Wikimedia Commons
+- 图片来源：互联网图片，当前使用 Pixabay
 - 字段映射：`expression`, `reading`, `glossary`, `sentence`, `note`, `url`, `audio`
 
 生成的内容会映射到 OnlineDictHelper：
@@ -33,6 +33,7 @@
 1. 安装并启动 Anki。
 2. 在 Anki 里安装 AnkiConnect 插件，保持 Anki 打开。
 3. 如果你要让脚本自己直连大模型生成内容，直接在 `anki_config.json` 的 `llm.api_key` 里填写对应的 API key。
+4. 如果你要从 Pixabay 拉取互联网图片，在 `anki_config.json` 的 `image.api_key` 里填写 Pixabay API key。`image.per_page` 控制查询页大小，`image.per_word_limit` 控制每个单词最终最多下载几张图，默认都为 3。
 
 你也可以在 `llm.prompt_template` 里直接改豆包提示词。
 
@@ -106,4 +107,4 @@ export ANKI_NOTE_TYPE="AI English Word"
 
 ## 说明
 
-使用 `OnlineDictHelper` 时，脚本只使用现有模板字段，不会修改模板。图片会优先从互联网获取；如果没有找到图片，会提示错误。
+使用 `OnlineDictHelper` 时，脚本只使用现有模板字段，不会修改模板。图片会优先从 Pixabay 获取并下载到本地后再写入 Anki；如果没有找到图片，会提示错误。
