@@ -25,6 +25,7 @@ OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/response
 DOUBAO_API_URL = os.getenv("DOUBAO_API_URL", "https://ark.cn-beijing.volces.com/api/v3/responses")
 OPENAI_IMAGE_API_URL = os.getenv("OPENAI_IMAGE_API_URL", "https://api.openai.com/v1/images/generations")
 PIXABAY_API_URL = os.getenv("PIXABAY_API_URL", "https://pixabay.com/api/")
+YOUDAO_AUDIO_URL = os.getenv("YOUDAO_AUDIO_URL", "http://dict.youdao.com/dictvoice")
 DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 DEFAULT_DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-seed-2-0-lite-260428")
 DEFAULT_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
@@ -691,6 +692,54 @@ def store_anki_media_from_paths(paths: list[str]) -> list[str]:
     return [store_anki_media_from_path(path) for path in paths]
 
 
+def config_wants_audio(config: dict[str, Any]) -> bool:
+    field_map = config.get("field_map")
+    if not isinstance(field_map, dict):
+        return False
+    return "audio" in field_map.values()
+
+
+def pronunciation_audio_filename(word: str) -> str:
+    return f"ankiword-youdao-{slugify(word)}.mp3"
+
+
+def download_pronunciation_audio(word: str) -> tuple[str, bytes]:
+    query = urllib.parse.urlencode({"type": 2, "audio": word})
+    audio_bytes = fetch_bytes(f"{YOUDAO_AUDIO_URL}?{query}")
+    if not audio_bytes:
+        raise RuntimeError(f"No pronunciation audio returned for {word!r}.")
+    return pronunciation_audio_filename(word), audio_bytes
+
+
+def store_pronunciation_audio(entry: dict[str, Any], config: dict[str, Any], logger: StepLogger) -> str:
+    existing_audio = str(entry.get("audio") or "").strip()
+    if existing_audio:
+        return existing_audio
+    if not config_wants_audio(config):
+        return ""
+
+    word = str(entry.get("word") or "").strip()
+    if not word:
+        return ""
+
+    logger.emit("store_audio", "running", word)
+    filename, audio_bytes = download_pronunciation_audio(word)
+    store_anki_media(filename, audio_bytes)
+    audio_field = f"[sound:{filename}]"
+    entry["audio"] = audio_field
+    logger.emit("store_audio", "ok", word, filename)
+    return audio_field
+
+
+def try_store_pronunciation_audio(entry: dict[str, Any], config: dict[str, Any], logger: StepLogger) -> str:
+    try:
+        return store_pronunciation_audio(entry, config, logger)
+    except Exception as exc:
+        word = str(entry.get("word") or "")
+        logger.emit("store_audio", "skipped", word, str(exc))
+        return ""
+
+
 def get_image_paths(entry: dict[str, Any]) -> list[str]:
     image_files = entry.get("image_files")
     if isinstance(image_files, list):
@@ -822,7 +871,7 @@ def build_configured_fields(entry: dict[str, Any], media_filenames: list[str], c
         ),
         "full_note": render_full_note(entry, media_filenames),
         "source_url": rendered_source_urls,
-        "audio": "",
+        "audio": str(entry.get("audio") or ""),
         "image": render_image_gallery(entry, media_filenames),
         "empty": "",
     }
@@ -1309,6 +1358,10 @@ def run_threaded_mode(
                     log_final_word(result, "failed", reason=reason)
                     continue
 
+            audio_field = try_store_pronunciation_audio(entry, config, logger)
+            if audio_field:
+                print_word_log_block("AUDIO", result["index"], total, entry["word"], audio_field)
+
             logger.emit("add_or_update_note", "running", entry["word"])
             print_word_log_block("ANKI", result["index"], total, entry["word"], "writing note serially")
             try:
@@ -1676,6 +1729,10 @@ def main() -> int:
                 logger.emit("store_media", "running", entry["word"], ", ".join(media_filenames))
                 store_anki_media(media_filenames[0], image_bytes)
                 logger.emit("store_media", "ok", entry["word"], ", ".join(media_filenames))
+
+            audio_field = try_store_pronunciation_audio(entry, config, logger)
+            if audio_field:
+                print_word_log_block("AUDIO", index, len(words), entry["word"], audio_field)
 
             logger.emit("add_or_update_note", "running", entry["word"])
             print(f"[{index}/{len(words)}] adding {entry['word']} to Anki...", file=sys.stderr)
