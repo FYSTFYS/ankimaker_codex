@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import datetime as dt
 import html
 import json
@@ -77,12 +79,38 @@ def _read_xlsx_sheet(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     return parsed_headers, parsed_rows
 
 
-def write_xlsx(path: Path, sheet_name: str, headers: list[str], rows: list[dict[str, Any]]) -> None:
+def read_xlsx_rows(path: Path, headers: list[str]) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        existing_headers, existing_rows = _read_xlsx_sheet(path)
+    except Exception:
+        return []
+    if existing_headers != headers:
+        return []
+    return existing_rows
+
+
+def write_xlsx(
+    path: Path,
+    sheet_name: str,
+    headers: list[str],
+    rows: list[dict[str, Any]],
+    *,
+    append: bool = True,
+) -> None:
     if not rows:
+        if append:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+    elif not append:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows and append:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
     existing_rows: list[dict[str, str]] = []
-    if path.exists():
+    if append and path.exists():
         try:
             existing_headers, existing_rows = _read_xlsx_sheet(path)
             if existing_headers and existing_headers != headers:
@@ -147,12 +175,15 @@ def write_xlsx(path: Path, sheet_name: str, headers: list[str], rows: list[dict[
         archive.writestr("xl/worksheets/sheet1.xml", worksheet)
 
 
-def write_text(path: Path, lines: list[str]) -> None:
+def write_text(path: Path, lines: list[str], *, append: bool = True) -> None:
     if not lines:
+        if not append:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     content = "\n".join(lines) + ("\n" if lines else "")
-    if path.exists() and path.stat().st_size > 0 and content:
+    if append and path.exists() and path.stat().st_size > 0 and content:
         with path.open("ab") as handle:
             handle.write(b"\n" if not path.read_bytes().endswith(b"\n") else b"")
             handle.write(content.encode("utf-8"))

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,7 +18,7 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
-from run_utils import StepLogger, write_text, write_xlsx
+from run_utils import StepLogger, read_xlsx_rows, write_text, write_xlsx
 
 
 ANKI_CONNECT_URL = os.getenv("ANKI_CONNECT_URL", "http://127.0.0.1:8765")
@@ -58,6 +60,9 @@ FIELDS = [
     "Collocations",
     "MemoryMethod",
 ]
+
+SUCCESS_HEADERS = ["timestamp", "word", "ai_status", "anki_status", "action", "note_id", "deck", "note_type"]
+FAILED_HEADERS = ["timestamp", "word", "ai_status", "anki_status", "stage", "error_type", "error_message", "deck", "note_type"]
 
 
 class NonEnglishWordError(RuntimeError):
@@ -960,6 +965,86 @@ def failed_summary_line(word: str, ai_status: str, anki_status: str, reason: str
     return "\t".join([word, f"AI={ai_status}", f"ANKI={anki_status}", reason])
 
 
+def word_key(word: str) -> str:
+    return word.strip().lower()
+
+
+def success_summary_line_from_row(row: dict[str, Any]) -> str:
+    return success_summary_line(
+        str(row.get("word", "")),
+        str(row.get("ai_status", "")),
+        str(row.get("anki_status", "")),
+        str(row.get("action", "")),
+        str(row.get("note_id", "")),
+    )
+
+
+def failed_summary_line_from_row(row: dict[str, Any]) -> str:
+    return failed_summary_line(
+        str(row.get("word", "")),
+        str(row.get("ai_status", "")),
+        str(row.get("anki_status", "")),
+        str(row.get("error_message", "")),
+    )
+
+
+def newer_status_row(current: dict[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
+    if current is None:
+        return dict(candidate)
+    if str(candidate.get("timestamp", "")) >= str(current.get("timestamp", "")):
+        return dict(candidate)
+    return current
+
+
+def build_latest_output_snapshots(
+    words: list[str],
+    success_xlsx: Path,
+    failed_xlsx: Path,
+    current_success_rows: list[dict[str, Any]],
+    current_failed_rows: list[dict[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    allowed_words = {word_key(word): word for word in words}
+    latest: dict[str, tuple[str, dict[str, Any]]] = {}
+
+    for row in read_xlsx_rows(success_xlsx, SUCCESS_HEADERS):
+        key = word_key(str(row.get("word", "")))
+        if key in allowed_words:
+            latest[key] = ("success", newer_status_row(latest.get(key, ("", None))[1], row))
+
+    for row in read_xlsx_rows(failed_xlsx, FAILED_HEADERS):
+        key = word_key(str(row.get("word", "")))
+        if key in allowed_words:
+            existing = latest.get(key)
+            if existing is None or str(row.get("timestamp", "")) >= str(existing[1].get("timestamp", "")):
+                latest[key] = ("failed", dict(row))
+
+    for row in current_success_rows:
+        key = word_key(str(row.get("word", "")))
+        if key in allowed_words:
+            latest[key] = ("success", dict(row))
+
+    for row in current_failed_rows:
+        key = word_key(str(row.get("word", "")))
+        if key in allowed_words:
+            latest[key] = ("failed", dict(row))
+
+    success_rows: list[dict[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+    for word in words:
+        status = latest.get(word_key(word))
+        if not status:
+            continue
+        status_type, row = status
+        if status_type == "success":
+            success_rows.append(row)
+        else:
+            failed_rows.append(row)
+
+    success_lines = [success_summary_line_from_row(row) for row in success_rows]
+    failed_lines = [failed_summary_line_from_row(row) for row in failed_rows]
+    return success_lines, success_rows, failed_lines, failed_rows
+
+
 def print_word_log_block(stage: str, index: int, total: int, word: str, detail: str = "") -> None:
     line = "=" * 88
     print(line, file=sys.stderr, flush=True)
@@ -1062,9 +1147,10 @@ def process_word_job(
         result["image_bytes"] = image_bytes
         return result
     except NonEnglishWordError:
-        result["status"] = "failed"
-        result["ai_status"] = "failed"
-        result["anki_status"] = "not_created"
+        result["status"] = "not_english"
+        result["ai_status"] = "not_english"
+        result["anki_status"] = "not_needed"
+        result["note_action"] = "not_english"
         result["reason"] = "非英文单词"
         return result
     except Exception as exc:
@@ -1097,8 +1183,6 @@ def run_threaded_mode(
     import_failed: list[str] = []
     import_success_rows: list[dict[str, Any]] = []
     import_failed_rows: list[dict[str, Any]] = []
-    written_success_count = 0
-    written_failed_count = 0
     success_txt = resolve_output_path(
         outputs.get("success_txt"),
         "import_success.txt",
@@ -1133,27 +1217,33 @@ def run_threaded_mode(
         logger.console = False
 
     def flush_outputs() -> None:
-        nonlocal written_success_count, written_failed_count
+        success_lines, success_rows, failed_lines, failed_rows = build_latest_output_snapshots(
+            words,
+            success_xlsx,
+            failed_xlsx,
+            import_success_rows,
+            import_failed_rows,
+        )
         logger.emit("write_import_success_txt", "running", "", str(success_txt))
-        write_text(success_txt, import_success[written_success_count:])
+        write_text(success_txt, success_lines, append=False)
         logger.emit("write_import_success_xlsx", "running", "", str(success_xlsx))
         write_xlsx(
             success_xlsx,
             "ImportSuccess",
-            ["timestamp", "word", "ai_status", "anki_status", "action", "note_id", "deck", "note_type"],
-            import_success_rows[written_success_count:],
+            SUCCESS_HEADERS,
+            success_rows,
+            append=False,
         )
         logger.emit("write_import_failed_txt", "running", "", str(failed_txt))
-        write_text(failed_txt, import_failed[written_failed_count:])
+        write_text(failed_txt, failed_lines, append=False)
         logger.emit("write_import_failed_xlsx", "running", "", str(failed_xlsx))
         write_xlsx(
             failed_xlsx,
             "ImportFailed",
-            ["timestamp", "word", "ai_status", "anki_status", "stage", "error_type", "error_message", "deck", "note_type"],
-            import_failed_rows[written_failed_count:],
+            FAILED_HEADERS,
+            failed_rows,
+            append=False,
         )
-        written_success_count = len(import_success)
-        written_failed_count = len(import_failed)
 
     def log_final_word(result: dict[str, Any], anki_status: str, action: str = "", reason: str = "") -> None:
         elapsed = time.monotonic() - result["started_at"]
@@ -1189,18 +1279,18 @@ def run_threaded_mode(
             existing_note_ids = existing_note_ids_for_word(deck, note_type, word, config)
             if existing_note_ids:
                 reason = "Anki 已存在该单词"
-                logger.emit("precheck_duplicate", "skipped", word, reason)
-                print_word_log_block("SKIP", index, total, word, reason)
-                import_failed.append(failed_summary_line(word, "not_created", "duplicate", reason))
-                import_failed_rows.append(
+                note_id = existing_note_ids[-1]
+                logger.emit("precheck_existing", "ok", word, reason)
+                print_word_log_block("EXISTS", index, total, word, f"{reason} note_id={note_id}")
+                import_success.append(success_summary_line(word, "not_created", "exists", "already_exists", note_id))
+                import_success_rows.append(
                     {
                         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                         "word": word,
                         "ai_status": "not_created",
-                        "anki_status": "duplicate",
-                        "stage": "precheck_duplicate",
-                        "error_type": "DuplicateNoteError",
-                        "error_message": reason,
+                        "anki_status": "exists",
+                        "action": "already_exists",
+                        "note_id": note_id,
                         "deck": deck,
                         "note_type": note_type,
                     }
@@ -1254,6 +1344,25 @@ def run_threaded_mode(
             completed_jobs += 1
             log_ready_word(result, completed_jobs, len(pending_jobs))
             entry = result["entry"]
+            if result["status"] == "not_english":
+                import_success.append(
+                    success_summary_line(result["word"], result["ai_status"], result["anki_status"], result["note_action"], "")
+                )
+                import_success_rows.append(
+                    {
+                        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                        "word": result["word"],
+                        "ai_status": result["ai_status"],
+                        "anki_status": result["anki_status"],
+                        "action": result["note_action"],
+                        "note_id": "",
+                        "deck": deck,
+                        "note_type": note_type,
+                    }
+                )
+                flush_outputs()
+                log_final_word(result, result["anki_status"], action=result["note_action"], reason=result.get("reason", ""))
+                continue
             if result["status"] != "ok" or entry is None:
                 import_failed.append(
                     failed_summary_line(
@@ -1525,8 +1634,6 @@ def main() -> int:
     import_failed: list[str] = []
     import_success_rows: list[dict[str, Any]] = []
     import_failed_rows: list[dict[str, Any]] = []
-    written_success_count = 0
-    written_failed_count = 0
     success_txt = resolve_output_path(
         outputs.get("success_txt"),
         "import_success.txt",
@@ -1572,21 +1679,21 @@ def main() -> int:
                 existing_note_ids = existing_note_ids_for_word(deck, note_type, word, config)
                 if existing_note_ids:
                     reason = "Anki 已存在该单词"
-                    logger.emit("precheck_duplicate", "skipped", word, reason)
-                    print(f"[{index}/{len(words)}] skipped {word}: {reason}", file=sys.stderr)
+                    note_id = existing_note_ids[-1]
+                    logger.emit("precheck_existing", "ok", word, reason)
+                    print_word_log_block("EXISTS", index, len(words), word, f"{reason} note_id={note_id}")
                     word_ai_status = "not_created"
-                    word_anki_status = "duplicate"
-                    word_reason = reason
-                    import_failed.append(failed_summary_line(word, "not_created", "duplicate", reason))
-                    import_failed_rows.append(
+                    word_anki_status = "exists"
+                    word_note_action = "already_exists"
+                    import_success.append(success_summary_line(word, "not_created", "exists", "already_exists", note_id))
+                    import_success_rows.append(
                         {
                             "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                             "word": word,
                             "ai_status": "not_created",
-                            "anki_status": "duplicate",
-                            "stage": "precheck_duplicate",
-                            "error_type": "DuplicateNoteError",
-                            "error_message": reason,
+                            "anki_status": "exists",
+                            "action": "already_exists",
+                            "note_id": note_id,
                             "deck": deck,
                             "note_type": note_type,
                         }
@@ -1612,19 +1719,19 @@ def main() -> int:
                 except NonEnglishWordError:
                     logger.emit("generate_entry", "skipped", word, "非英文单词")
                     print(f"[{index}/{len(words)}] 非英文单词: {word}", file=sys.stderr)
-                    word_ai_status = "failed"
-                    word_anki_status = "not_created"
+                    word_ai_status = "not_english"
+                    word_anki_status = "not_needed"
+                    word_note_action = "not_english"
                     word_reason = "非英文单词"
-                    import_failed.append(failed_summary_line(word, "failed", "not_created", "非英文单词"))
-                    import_failed_rows.append(
+                    import_success.append(success_summary_line(word, "not_english", "not_needed", "not_english", ""))
+                    import_success_rows.append(
                         {
                             "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
                             "word": word,
-                            "ai_status": "failed",
-                            "anki_status": "not_created",
-                            "stage": "generate_entry",
-                            "error_type": "NonEnglishWordError",
-                            "error_message": "非英文单词",
+                            "ai_status": "not_english",
+                            "anki_status": "not_needed",
+                            "action": "not_english",
+                            "note_id": "",
                             "deck": deck,
                             "note_type": note_type,
                         }
@@ -1840,26 +1947,33 @@ def main() -> int:
             print_word_log_block("END", index, len(words), word, summary)
             logger.emit("word_end", "ok", word, summary)
 
+        success_lines, success_rows, failed_lines, failed_rows = build_latest_output_snapshots(
+            words,
+            success_xlsx,
+            failed_xlsx,
+            import_success_rows,
+            import_failed_rows,
+        )
         logger.emit("write_import_success_txt", "running", "", str(success_txt))
-        write_text(success_txt, import_success[written_success_count:])
+        write_text(success_txt, success_lines, append=False)
         logger.emit("write_import_success_xlsx", "running", "", str(success_xlsx))
         write_xlsx(
             success_xlsx,
             "ImportSuccess",
-            ["timestamp", "word", "ai_status", "anki_status", "action", "note_id", "deck", "note_type"],
-            import_success_rows[written_success_count:],
+            SUCCESS_HEADERS,
+            success_rows,
+            append=False,
         )
         logger.emit("write_import_failed_txt", "running", "", str(failed_txt))
-        write_text(failed_txt, import_failed[written_failed_count:])
+        write_text(failed_txt, failed_lines, append=False)
         logger.emit("write_import_failed_xlsx", "running", "", str(failed_xlsx))
         write_xlsx(
             failed_xlsx,
             "ImportFailed",
-            ["timestamp", "word", "ai_status", "anki_status", "stage", "error_type", "error_message", "deck", "note_type"],
-            import_failed_rows[written_failed_count:],
+            FAILED_HEADERS,
+            failed_rows,
+            append=False,
         )
-        written_success_count = len(import_success)
-        written_failed_count = len(import_failed)
 
     if preview_json_path:
         logger.emit("write_preview_json", "running", "", str(preview_json_path))
